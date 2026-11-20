@@ -64,13 +64,20 @@ pub fn start(threshold_ns: u64, window_s: u64, list_max: Option<u64>, traced: us
 }
 
 /// What was found out about a traced process.
-pub fn process(pid: u32, units: &str, http2_handlers_followed: bool, note: Option<&str>) -> Value {
+pub fn process(
+    pid: u32,
+    units: &str,
+    http2_handlers_followed: bool,
+    note: Option<&str>,
+    unsupported: &[String],
+) -> Value {
     json!({
         "type": "process",
         "pid": pid,
         "units": units,
         "http2_handlers_followed": http2_handlers_followed,
         "note": note,
+        "unsupported": unsupported,
     })
 }
 
@@ -377,6 +384,7 @@ pub fn fields() -> Value {
                 "units": "What a request's time is attributed by: `thread`, `goroutine` (Go) or `task` (tokio).",
                 "http2_handlers_followed": "Whether probes are attached that find the goroutine or task serving each HTTP/2 stream. If false, HTTP/2 calls of this process have no `handler` and no `time`.",
                 "note": "The agent's own words on the above, with versions and, where something is not followed, why.",
+                "unsupported": "Versions the process uses that the agent does not know (Go, grpc-go, tokio, rustc), each with what is not followed because of it; also printed to stderr as warnings. Empty: none.",
             },
             "call": {
                 "about": "One request that took at least `threshold_ns`: from the first byte of the request read by the server to the last byte of the response written (or to the reset).",
@@ -625,7 +633,10 @@ mod tests {
         http1.down_calls = 1;
         keys(&call(&http1, None, None, 0), &mut written);
         keys(&start(1, 10, Some(50), 1), &mut written);
-        keys(&process(1, "goroutine", true, Some("x")), &mut written);
+        keys(
+            &process(1, "goroutine", true, Some("x"), &["y".to_string()]),
+            &mut written,
+        );
         keys(
             &service(
                 Some(10),

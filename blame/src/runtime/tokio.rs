@@ -253,8 +253,11 @@ fn rustc_version(image: &[u8]) -> Option<(u32, String)> {
 /// nightly (the same in all of them), and run on the last two; 1.75 and
 /// earlier differ; 1.76 and 1.77 were not looked at.
 fn header_map_entries(minor: u32) -> Option<(u16, u16)> {
-    (minor >= 78).then_some((32, 40))
+    (minor >= RUSTC_MIN_MINOR).then_some((32, 40))
 }
+
+/// The oldest rustc whose `http::HeaderMap` layout is known (above).
+const RUSTC_MIN_MINOR: u32 = 78;
 
 /// h2's functions that are given decoded headers: `Recv::recv_headers`
 /// (one function) and `Send::send_headers` / `send_trailers` (generic: one
@@ -392,16 +395,21 @@ pub(super) fn inspect(elf: &Elf, spawned: bool) -> Option<Inspected> {
             ))));
         }
         (Some(_), None) => {
-            return Some(Inspected::threads(Some(
+            return Some(Inspected::unsupported(
                 "tokio of unknown version: not supported, thread-level".to_string(),
-            )));
+                "the tokio version could not be read: requests are attributed by thread, not by task"
+                    .to_string(),
+            ));
         }
         (Some(_), Some(version)) => version,
     };
     if !(TOKIO_MIN_MINOR..=TOKIO_MAX_MINOR).contains(&minor) {
-        return Some(Inspected::threads(Some(format!(
-            "tokio {version}: not supported, thread-level"
-        ))));
+        return Some(Inspected::unsupported(
+            format!("tokio {version}: not supported, thread-level"),
+            format!(
+                "tokio {version} is not one of the versions blame knows (1.{TOKIO_MIN_MINOR} to 1.{TOKIO_MAX_MINOR}): requests are attributed by thread, not by task"
+            ),
+        ));
     }
     let offset = elf
         .tls
@@ -424,6 +432,7 @@ pub(super) fn inspect(elf: &Elf, spawned: bool) -> Option<Inspected> {
             let h2 = find(elf.image, b"/h2-0.").is_some();
             let mut probes = task_probes(elf);
             let mut headers_note = String::new();
+            let mut unsupported = Vec::new();
             let mut cfg_with_headers = cfg;
             if h2 && !probes.is_empty() {
                 let (header, entries, note) = header_probes(elf);
@@ -433,6 +442,13 @@ pub(super) fn inspect(elf: &Elf, spawned: bool) -> Option<Inspected> {
                     cfg_with_headers.rs_entries_len = len;
                 }
                 headers_note = format!("; {note}");
+                if let Some((minor, rustc)) = rustc_version(elf.image)
+                    && header_map_entries(minor).is_none()
+                {
+                    unsupported.push(format!(
+                        "rustc {rustc} is older than the versions blame knows (1.{RUSTC_MIN_MINOR} and later): names and trace ids of HTTP/2 calls on connections opened before blame attached are not read"
+                    ));
+                }
             }
             if probes.is_empty() {
                 let not_spawned = if spawned {
@@ -448,6 +464,7 @@ pub(super) fn inspect(elf: &Elf, spawned: bool) -> Option<Inspected> {
                     spawn_skip: Vec::new(),
                     go_wait_kinds: Vec::new(),
                     http2_handlers: false,
+                    unsupported,
                 }
             } else {
                 let blocking = if spawned {
@@ -536,6 +553,7 @@ pub(super) fn inspect(elf: &Elf, spawned: bool) -> Option<Inspected> {
                     spawn_skip: Vec::new(),
                     go_wait_kinds: Vec::new(),
                     http2_handlers: h2,
+                    unsupported,
                 }
             }
         }

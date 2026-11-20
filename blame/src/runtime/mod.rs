@@ -99,6 +99,9 @@ pub struct Inspected {
     /// Probes find the goroutine or task that serves each HTTP/2 stream
     /// (if they can be attached).
     pub http2_handlers: bool,
+    /// Versions the process uses that blame does not know, each with what is
+    /// not followed because of it: told the user as warnings. Empty: none.
+    pub unsupported: Vec<String>,
 }
 
 impl Inspected {
@@ -111,7 +114,16 @@ impl Inspected {
             spawn_skip: Vec::new(),
             go_wait_kinds: Vec::new(),
             http2_handlers: false,
+            unsupported: Vec::new(),
         }
+    }
+
+    /// A process followed by thread only, because of a version blame does
+    /// not know: `note` as usual, and `warning` to say so.
+    fn unsupported(note: String, warning: String) -> Self {
+        let mut found = Self::threads(Some(note));
+        found.unsupported.push(warning);
+        found
     }
 
     /// The same process when its probes could not be attached.
@@ -125,6 +137,7 @@ impl Inspected {
                 spawn_skip: Vec::new(),
                 go_wait_kinds: Vec::new(),
                 http2_handlers: false,
+                unsupported: self.unsupported,
             },
             None => Self {
                 probes: Vec::new(),

@@ -1,5 +1,13 @@
-//! blame agent — M0: prove the kernel-to-userspace path is reliable, cheap,
-//! and honest about what it drops.
+//! blame: where the time of a service's requests went, from eBPF, without
+//! changing or restarting the service.
+//!
+//! `slow` is the tool: each HTTP/1.1 request and HTTP/2 or gRPC call the
+//! traced processes serve, split into time on a CPU, waiting for one, and
+//! blocked on the disk, a downstream call, a file service and the like, by
+//! thread, goroutine or tokio task. `top` and `runq` show how long runnable
+//! threads wait for a CPU, per service or for the machine. Without a
+//! subcommand the agent streams process starts: a check that the path from
+//! the kernel to user space works and says what it drops.
 
 mod bpf;
 mod cgroupfs;
@@ -57,7 +65,7 @@ enum Command {
     Runq(runq::RunqOpt),
     /// Show run-queue latency per service, container or pod.
     Top(top::TopOpt),
-    /// Show slow HTTP/1.1 requests and where their time went.
+    /// Show slow requests (HTTP/1.1, HTTP/2, gRPC) and where their time went.
     Slow(slow::SlowOpt),
 }
 
@@ -78,7 +86,8 @@ async fn main() -> Result<()> {
     }
 }
 
-/// The default mode: trace `sched_process_exec` and stream the events.
+/// Without a subcommand: trace `sched_process_exec` and stream the events,
+/// with what the ring buffer lost.
 async fn run_exec_trace(opt: Opt) -> Result<()> {
     let mut open = bpf::open()?;
     bpf::autoload_only(&mut open, &["sched_process_exec"]);

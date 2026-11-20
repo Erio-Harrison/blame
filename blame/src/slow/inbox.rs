@@ -167,7 +167,7 @@ pub(super) fn place_stream_ids(inbox: &mut Inbox, skel: &Skel, json: bool) {
                     if json {
                         println!(
                             "{}",
-                            json::process(event.hdr.pid, "task", true, Some(&note))
+                            json::process(event.hdr.pid, "task", true, Some(&note), &[])
                         );
                     } else {
                         println!("blame: pid {}: {note}", event.hdr.pid);

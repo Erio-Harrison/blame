@@ -43,11 +43,36 @@ static __always_inline struct carrier *carrier_of_current(bool create)
 	return cr;
 }
 
+/*
+ * The parts of a stretch of time are SEG_CPU to SEG_MAX - 1: these go
+ * through all of them, so that a part added to the enum is not missed.
+ */
 static __always_inline bool acc_empty(const struct seg_acc *acc)
 {
-	return !(acc->ns[SEG_CPU] | acc->ns[SEG_RUNQ] | acc->ns[SEG_BLK_DOWN] |
-		 acc->ns[SEG_BLK_CLIENT] | acc->ns[SEG_BLK_IO] | acc->ns[SEG_BLK_MEM] |
-		 acc->ns[SEG_BLK_OTHER] | acc->ns[SEG_BLK_FSVC] | acc->ns[SEG_BLK_FSVC_LOCK]);
+	u64 any = 0;
+
+#pragma unroll
+	for (int i = 0; i < SEG_MAX; i++)
+		any |= acc->ns[i];
+	return !any;
+}
+
+static __always_inline u64 acc_total(const struct seg_acc *acc)
+{
+	u64 total = 0;
+
+#pragma unroll
+	for (int i = 0; i < SEG_MAX; i++)
+		total += acc->ns[i];
+	return total;
+}
+
+/* Add `acc` to `to`, which threads on other CPUs add to as well. */
+static __always_inline void acc_add_to(struct seg_acc *to, const struct seg_acc *acc)
+{
+#pragma unroll
+	for (int i = 0; i < SEG_MAX; i++)
+		__sync_fetch_and_add(&to->ns[i], acc->ns[i]);
 }
 
 static __always_inline void acc_clear(struct seg_acc *acc)
@@ -66,9 +91,7 @@ static __always_inline bool req_add(u64 req_id, struct seg_acc *acc, u8 source)
 
 	if (acc_empty(acc))
 		return true;
-	total = acc->ns[SEG_CPU] + acc->ns[SEG_RUNQ] + acc->ns[SEG_BLK_DOWN] +
-		acc->ns[SEG_BLK_CLIENT] + acc->ns[SEG_BLK_IO] + acc->ns[SEG_BLK_MEM] +
-		acc->ns[SEG_BLK_OTHER] + acc->ns[SEG_BLK_FSVC] + acc->ns[SEG_BLK_FSVC_LOCK];
+	total = acc_total(acc);
 	req = bpf_map_lookup_elem(&REQ_TABLE, &req_id);
 	if (!req) {
 		/*
@@ -84,27 +107,11 @@ static __always_inline bool req_add(u64 req_id, struct seg_acc *acc, u8 source)
 		return false;
 	}
 	if (source == SRC_SPAWN) {
-		__sync_fetch_and_add(&req->helper.ns[SEG_CPU], acc->ns[SEG_CPU]);
-		__sync_fetch_and_add(&req->helper.ns[SEG_RUNQ], acc->ns[SEG_RUNQ]);
-		__sync_fetch_and_add(&req->helper.ns[SEG_BLK_DOWN], acc->ns[SEG_BLK_DOWN]);
-		__sync_fetch_and_add(&req->helper.ns[SEG_BLK_CLIENT], acc->ns[SEG_BLK_CLIENT]);
-		__sync_fetch_and_add(&req->helper.ns[SEG_BLK_IO], acc->ns[SEG_BLK_IO]);
-		__sync_fetch_and_add(&req->helper.ns[SEG_BLK_MEM], acc->ns[SEG_BLK_MEM]);
-		__sync_fetch_and_add(&req->helper.ns[SEG_BLK_OTHER], acc->ns[SEG_BLK_OTHER]);
-		__sync_fetch_and_add(&req->helper.ns[SEG_BLK_FSVC], acc->ns[SEG_BLK_FSVC]);
-		__sync_fetch_and_add(&req->helper.ns[SEG_BLK_FSVC_LOCK], acc->ns[SEG_BLK_FSVC_LOCK]);
+		acc_add_to(&req->helper, acc);
 		acc_clear(acc);
 		return true;
 	}
-	__sync_fetch_and_add(&req->acc.ns[SEG_CPU], acc->ns[SEG_CPU]);
-	__sync_fetch_and_add(&req->acc.ns[SEG_RUNQ], acc->ns[SEG_RUNQ]);
-	__sync_fetch_and_add(&req->acc.ns[SEG_BLK_DOWN], acc->ns[SEG_BLK_DOWN]);
-	__sync_fetch_and_add(&req->acc.ns[SEG_BLK_CLIENT], acc->ns[SEG_BLK_CLIENT]);
-	__sync_fetch_and_add(&req->acc.ns[SEG_BLK_IO], acc->ns[SEG_BLK_IO]);
-	__sync_fetch_and_add(&req->acc.ns[SEG_BLK_MEM], acc->ns[SEG_BLK_MEM]);
-	__sync_fetch_and_add(&req->acc.ns[SEG_BLK_OTHER], acc->ns[SEG_BLK_OTHER]);
-	__sync_fetch_and_add(&req->acc.ns[SEG_BLK_FSVC], acc->ns[SEG_BLK_FSVC]);
-	__sync_fetch_and_add(&req->acc.ns[SEG_BLK_FSVC_LOCK], acc->ns[SEG_BLK_FSVC_LOCK]);
+	acc_add_to(&req->acc, acc);
 	if (source == SRC_RETRO)
 		__sync_fetch_and_add(&req->retro_ns, total);
 	else

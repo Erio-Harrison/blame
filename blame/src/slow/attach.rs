@@ -62,6 +62,8 @@ pub(super) struct ProcessNote {
     /// Probes that find the handler of each HTTP/2 stream are attached.
     http2_handlers_followed: bool,
     note: Option<String>,
+    /// Versions blame does not know (`Inspected::unsupported`).
+    unsupported: Vec<String>,
 }
 
 impl ProcessNote {
@@ -75,12 +77,17 @@ impl ProcessNote {
             },
             http2_handlers_followed: found.http2_handlers,
             note: found.note.clone(),
+            unsupported: found.unsupported.clone(),
         }
     }
 
     /// Tell the user: a line, or a record. Plain threaded processes with
     /// nothing to say are only mentioned as records.
     pub(super) fn print(&self, opt: &SlowOpt) {
+        // On stderr in both modes: easy to miss among the records otherwise.
+        for warning in &self.unsupported {
+            eprintln!("blame: warning: pid {}: {warning}", self.pid);
+        }
         if opt.json {
             println!(
                 "{}",
@@ -88,7 +95,8 @@ impl ProcessNote {
                     self.pid,
                     self.units,
                     self.http2_handlers_followed,
-                    self.note.as_deref()
+                    self.note.as_deref(),
+                    &self.unsupported
                 )
             );
         } else if let Some(note) = &self.note {
@@ -785,6 +793,7 @@ fn inspect(opt: &SlowOpt, pid: u32) -> Inspected {
             spawn_skip: Vec::new(),
             go_wait_kinds: Vec::new(),
             http2_handlers: false,
+            unsupported: Vec::new(),
         }
     } else {
         runtime::inspect(Path::new("/proc"), pid, opt.deep)

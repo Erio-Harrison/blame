@@ -24,6 +24,12 @@ const FN_GOPARK: &str = "runtime.gopark";
 /// Where a goroutine that has returned leaves its thread (see `bpf/runtime/go_park.h`).
 const FN_GOEXIT0: &str = "runtime.goexit0";
 
+/// The Go minor versions whose runtime offsets and wait reasons are in the
+/// tables below. Another version is followed by thread, with a warning.
+const GO_MINORS: std::ops::RangeInclusive<u32> = 18..=27;
+/// The grpc-go minor versions whose stream layout is in the table below.
+const GRPC_MINORS: std::ops::RangeInclusive<u32> = 40..=85;
+
 /// What each `waitReason` of a Go minor version is, one letter per value
 /// from 0: c a channel, s a sync primitive (Mutex, RWMutex, Cond,
 /// WaitGroup, semacquire), z asleep, n the network poller, g the garbage
@@ -385,8 +391,16 @@ fn follow_spawned(elf: &Elf, minor: u32, found: &mut Inspected, plain_cfg: ProcC
             found.go_wait_kinds = kinds;
         }
         (None, _) => note.push_str("; why goroutines park not followed: runtime.gopark not found"),
-        (_, None) => note
-            .push_str("; why goroutines park not followed: wait reasons of this version not known"),
+        (_, None) => {
+            note.push_str(
+                "; why goroutines park not followed: wait reasons of this version not known",
+            );
+            found.unsupported.push(format!(
+                "the wait reasons of Go 1.{minor} are not known (1.{} to 1.{} are): why goroutines park is not shown",
+                GO_MINORS.start(),
+                GO_MINORS.end()
+            ));
+        }
     }
     // When a goroutine that has returned leaves its thread: exact with the probe,
     // known at the thread's next goroutine or sleep without it.
@@ -414,17 +428,36 @@ pub(super) fn inspect(elf: &Elf, spawned: bool) -> Option<Inspected> {
     let version = match go_version(buildinfo)? {
         Ok(version) => version,
         Err(what) => {
-            return Some(Inspected::threads(Some(format!(
-                "{what}: not supported, thread-level"
-            ))));
+            return Some(Inspected::unsupported(
+                format!("{what}: not supported, thread-level"),
+                format!(
+                    "the Go version could not be read ({what}): requests are attributed by thread, not by goroutine"
+                ),
+            ));
         }
     };
     let Some(cfg) = go_minor(&version).and_then(go_offsets) else {
-        return Some(Inspected::threads(Some(format!(
-            "{version}: not supported, thread-level"
-        ))));
+        return Some(Inspected::unsupported(
+            format!("{version}: not supported, thread-level"),
+            format!(
+                "{version} is not one of the Go versions blame knows (1.{} to 1.{}): requests are attributed by thread, not by goroutine",
+                GO_MINORS.start(),
+                GO_MINORS.end()
+            ),
+        ));
     };
     let plain = format!("{version}: goroutine-level");
+    let grpc_unknown = grpc_module(&go_modules(buildinfo))
+        .filter(|(grpc_version, replaced)| {
+            !replaced && grpc_minor(grpc_version).and_then(grpc_stream_id).is_none()
+        })
+        .map(|(grpc_version, _)| {
+            format!(
+                "grpc-go {grpc_version} is not one of the versions blame knows (1.{} to 1.{}): gRPC calls are not followed to their handlers, and have no time breakdown",
+                GRPC_MINORS.start(),
+                GRPC_MINORS.end()
+            )
+        });
     let mut found = match grpc(elf, buildinfo, cfg) {
         Some((with_grpc, probes, what)) if !probes.is_empty() => Inspected {
             cfg: with_grpc,
@@ -437,6 +470,7 @@ pub(super) fn inspect(elf: &Elf, spawned: bool) -> Option<Inspected> {
             spawn_skip: Vec::new(),
             go_wait_kinds: Vec::new(),
             http2_handlers: true,
+            unsupported: Vec::new(),
         },
         Some((_, _, what)) => Inspected {
             cfg,
@@ -446,6 +480,7 @@ pub(super) fn inspect(elf: &Elf, spawned: bool) -> Option<Inspected> {
             spawn_skip: Vec::new(),
             go_wait_kinds: Vec::new(),
             http2_handlers: false,
+            unsupported: Vec::new(),
         },
         None => Inspected {
             cfg,
@@ -455,8 +490,10 @@ pub(super) fn inspect(elf: &Elf, spawned: bool) -> Option<Inspected> {
             spawn_skip: Vec::new(),
             go_wait_kinds: Vec::new(),
             http2_handlers: false,
+            unsupported: Vec::new(),
         },
     };
+    found.unsupported.extend(grpc_unknown);
     // Which goroutine a thread runs is told by a probe where the scheduler
     // puts one on it. Without it, it is read at kernel events only, and a
     // goroutine that waits for another one and is run again on the same
@@ -508,6 +545,28 @@ mod tests {
         out.push(version.len() as u8);
         out.extend(version.as_bytes());
         out
+    }
+
+    /// The ranges the warnings name are the tables' (a version added to a
+    /// table without its range, or the other way round, fails here).
+    #[test]
+    fn the_known_versions_are_the_tables() {
+        for minor in 0..60 {
+            let known = GO_MINORS.contains(&minor);
+            assert_eq!(go_offsets(minor).is_some(), known, "Go offsets, 1.{minor}");
+            assert_eq!(
+                go_wait_reasons(minor).is_some(),
+                known,
+                "Go wait reasons, 1.{minor}"
+            );
+        }
+        for minor in 0..200 {
+            assert_eq!(
+                grpc_stream_id(minor).is_some(),
+                GRPC_MINORS.contains(&minor),
+                "grpc-go 1.{minor}"
+            );
+        }
     }
 
     #[test]
