@@ -1,0 +1,39 @@
+# Build output. `CARGO_TARGET_DIR` may point elsewhere, but a workspace-local
+# `target/` is the default and must never be committed.
+target/
+
+# Backup files produced by rustfmt.
+**/*.rs.bk
+
+# Profiling and debugging artifacts (perf, flamegraphs, core dumps, coverage).
+perf.data
+perf.data.*
+flamegraph*.svg
+core.[0-9]*
+*.profraw
+
+# Compiled BPF objects and extracted BTF blobs. The eBPF program is built by
+# `blame/build.rs` into `OUT_DIR`; stray copies are experiment leftovers.
+*.o
+*.btf
+
+# Local secrets and logs.
+.env
+.env.*
+*.log
+
+# OS and editor noise.
+.DS_Store
+.idea/
+*.swp
+*~
+
+# Claude Code local state.
+.claude/
+
+# Local cargo config (e.g. a `runner = "sudo -E"` for `cargo run`).
+.cargo/config.toml
+__pycache__/
+
+# Working notes, kept out of the repository.
+blog-notes/

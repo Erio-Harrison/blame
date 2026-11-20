@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = [
+    "blame",
+    "blame-common",
+]
+
+[workspace.package]
+license = "MIT"
+edition = "2024"
+
+[workspace.dependencies]
+# libbpf is built from the vendored source and linked statically; libelf and
+# zlib are linked dynamically.
+libbpf-rs = { version = "0.27.2" }
+libbpf-sys = { version = "1.7.0" }
+libbpf-cargo = { version = "0.27.2" }
+
+anyhow = { version = "1", default-features = false }
+# clap does not build without `std`, even with default features off.
+clap = { version = "4.5.20", default-features = false, features = ["std"] }
+env_logger = { version = "0.11.5", default-features = false }
+libc = { version = "0.2.159", default-features = false }
+log = { version = "0.4.22", default-features = false }
+# `preserve_order`: `--json` records are written with their fields in the
+# order they are put together (`type` first), not sorted by name.
+serde_json = { version = "1", default-features = false, features = ["std", "preserve_order"] }
+tokio = { version = "1.40.0", default-features = false }

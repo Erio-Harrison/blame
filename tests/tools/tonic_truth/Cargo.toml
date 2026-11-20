@@ -1,0 +1,17 @@
+[package]
+name = "tonic_truth"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+tonic = "0.14"
+tonic-prost = "0.14"
+prost = "0.14"
+tokio = { version = "1.49", features = ["rt-multi-thread", "net", "time", "signal", "macros"] }
+
+[profile.release]
+# The agent finds tokio's functions by their symbols.
+strip = false
+
+[workspace]

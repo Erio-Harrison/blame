@@ -1,0 +1,19 @@
+{
+    // IntelliSense for the eBPF programs in blame/src/bpf. The build uses
+    // the libbpf headers vendored by libbpf-sys; the editor reads the system
+    // copy from libbpf-dev (/usr/include/bpf).
+    "configurations": [
+        {
+            "name": "eBPF",
+            "includePath": [
+                "${workspaceFolder}/blame/src/bpf",
+                "/usr/include"
+            ],
+            "compilerPath": "/usr/bin/clang",
+            "compilerArgs": ["-target", "bpf", "-mcpu=v3"],
+            "cStandard": "c11",
+            "intelliSenseMode": "linux-clang-arm64"
+        }
+    ],
+    "version": 4
+}
