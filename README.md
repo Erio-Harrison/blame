@@ -1,5 +1,12 @@
 # blame
 
+Where the time of a service's requests went, from eBPF, without changing or
+restarting the service: each HTTP/1.1 request and gRPC call split into time on
+a CPU, waiting for one, and blocked on the disk, a downstream call, a file
+service or a lock, by thread, goroutine or tokio task. Worked examples with
+their figures are in `examples/` (`thread-server`, `torch-inference`,
+`pay-demo`).
+
 The kernel side is C (`blame/src/bpf/`), compiled with clang and loaded by
 libbpf through [libbpf-rs](https://github.com/libbpf/libbpf-rs); the agent is Rust.
 
@@ -104,6 +111,8 @@ cargo test                                # unit tests
                                           # the Go server needs a Go toolchain (GO=/path/to/go, or go on PATH)
 ./tests/scenarios/core_acceptance.sh      # CO-RE relocation against fake target layouts
 ./tests/scenarios/accuracy_acceptance.sh  # run-queue p99 / p99.9 against a known answer (systemd)
+./tests/scenarios/cpu_wait.sh             # a process's four waits for a CPU against an oracle (bpftrace)
+./tests/check.sh                          # fmt, clippy, unit tests; --full adds all scenarios above but core_acceptance
 ```
 
 ## License

@@ -43,33 +43,29 @@ Keep the output directory on a local disk: `/save` writes there. Each run loads
 the servers for 24 s, attaches blame 3 s in and watches for 15 s. It uses CPUs
 0-5: the front server on 0-1, the backend on 2, the load on 4-5.
 
-## What it showed (2026-11-18, the arm64 VM, `normal`)
+## What it showed (2026-11-21, the arm64 VM, `normal`)
+
+p50 of the request, then where its time went, mean per request:
 
 | request | p50 | CPU | waiting for CPU | disk | downstream | other blocked |
 |---|---|---|---|---|---|---|
-| `/compute` | 2.0 ms | 1,683 us | 661 us | | | |
-| `/lock` | 1.3 ms | 946 us | 586 us | | | 501 us |
-| `/save` | 0.4 ms | 40 us | 740 us | 374 us | | 14 us |
-| `/backend` | 5.3 ms | 24 us | 630 us | | 4,516 us | |
+| `/compute` | 2.0 ms | 1,669 us | 624 us | | | |
+| `/lock` | 1.3 ms | 933 us | 537 us | | | 413 us |
+| `/save` | 0.5 ms | 38 us | 710 us | 332 us | | 9 us |
+| `/backend` | 5.3 ms | 24 us | 600 us | | 5,161 us | |
 
-Against the servers' own figures, over 51,029 requests: CPU +1.7%, waiting for
-a CPU +2.8%, the wait for the mutex −1.6%, write + fsync −3.2%, nanosleep −0.0%
-(99.4–100% of requests within 100 us or 10%).
+Against the servers' own figures, over 53,172 requests: CPU +1.6%, waiting for
+a CPU +2.0%, the wait for the mutex −1.4%, write + fsync −2.0%, the call to the
+backend −0.2%, nanosleep −0.0% (99.5–100% of requests within 100 us or 10%).
+Every call to the backend was seen, though blame attached with calls in flight.
+
+In `cpu` the wait for a CPU grew: `/compute` from 624 to 1,087 us, `/save` from
+710 to 1,366 us (against the servers' figures: −0.6% to +1.2%).
 
 What a thread can tell and what it cannot:
 
 - A wait for a mutex is shown as `other`: in the kernel it is a sleep on a futex,
   the same as a condition variable's. Telling them apart takes a runtime's help
   (Go and tokio have it).
-- `/save` takes 0.4 ms at p50, but most of it is waiting for a CPU after the
-  flush, not the disk: with 16 threads on two CPUs, a thread the disk wakes
-  waits its turn.
-
-## Known issue
-
-A connection to the backend that has a call in flight when blame attaches is
-not seen as a call afterwards: none of the calls on it are, and its thread's
-wait shows as `off thread` instead of `downstream`. In the run above, 2 of the
-16 front threads (1,282 of 10,206 `/backend` calls) were affected, which is why
-the backend call row in `report.py` is −12.7%. With blame attached before the
-load starts, 1 call in 6,912 is missed.
+- `/save` waits twice as long for a CPU (710 us) as for the disk (332 us): with
+  16 threads on two CPUs, a thread the disk wakes waits its turn.
