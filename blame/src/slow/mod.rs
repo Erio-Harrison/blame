@@ -218,23 +218,18 @@ pub async fn run(opt: SlowOpt) -> Result<()> {
                 previous_cpu = cpu_now;
                 let over_ns = elapsed_ns(window_started);
                 window_started = Instant::now();
-                if opt.json {
-                    let (slow, listed) = (inbox.borrow().slow, inbox.borrow().listed);
-                    print_json_summaries(
-                        Some(opt.interval),
-                        &services,
-                        &by_method,
-                        &mut resolver,
-                        (&cpu, over_ns),
-                        json::health(Some(opt.interval), &counters, slow, listed, None),
-                    );
-                } else {
-                    println!("--- slow (window {}s) ---", opt.interval);
-                    print!("{}", render_services(&services, opt.rows));
-                    print!("{}", render_methods(&by_method, &mut resolver, &opt));
-                    print!("{}", render_cpu(&cpu, over_ns, &opt));
-                    println!("  {}", kernel_line(&counters));
-                }
+                let (slow, listed) = (inbox.borrow().slow, inbox.borrow().listed);
+                let summary = Summary {
+                    window_s: Some(opt.interval),
+                    services: &services,
+                    by_method: &by_method,
+                    cpu: &cpu,
+                    over_ns,
+                    counters: &counters,
+                    slow,
+                    listed,
+                };
+                print_summaries(&summary, None, &mut resolver, &opt, skel)?;
             }
         }
     }
@@ -247,50 +242,109 @@ pub async fn run(opt: SlowOpt) -> Result<()> {
     let counters = Counters::read(skel)?;
     let cpu = cpu_tracker.read(skel)?;
     let over_ns = elapsed_ns(started);
+    let services = aggregate(&read_groups(skel)?, &mut resolver);
+    let usage = usage.sample()?;
+    let inbox = inbox.borrow();
+    let summary = Summary {
+        window_s: None,
+        services: &services,
+        by_method: inbox.methods.total(),
+        cpu: &cpu,
+        over_ns,
+        counters: &counters,
+        slow,
+        listed: shown,
+    };
+    let end = RunEnd {
+        elapsed,
+        cpu_percent: usage.cpu_percent,
+        rss_bytes: usage.rss_bytes,
+        rejected: inbox.rejected,
+    };
+    print_summaries(&summary, Some(&end), &mut resolver, &opt, skel)
+}
+
+/// What the summaries of a window or of the whole run cover.
+struct Summary<'a> {
+    /// The window's length; `None`: the whole run.
+    window_s: Option<u64>,
+    services: &'a [(String, Hist)],
+    by_method: &'a methods::Sums,
+    cpu: &'a std::collections::BTreeMap<u32, proc_cpu::ProcCpu>,
+    /// The time `cpu` covers.
+    over_ns: u64,
+    counters: &'a Counters,
+    /// Slow requests so far, and how many of them were written.
+    slow: u64,
+    listed: u64,
+}
+
+/// What only the summary of the whole run says: how long it ran, and what
+/// the agent itself used and rejected.
+struct RunEnd {
+    elapsed: Duration,
+    cpu_percent: f64,
+    rss_bytes: u64,
+    rejected: u64,
+}
+
+/// The summaries of a window, or (with `end`) of the whole run, in the
+/// format asked for. The one place both are written, so that what one of
+/// them shows the other does too.
+fn print_summaries(
+    summary: &Summary<'_>,
+    end: Option<&RunEnd>,
+    resolver: &mut Resolver,
+    opt: &SlowOpt,
+    skel: &Skel,
+) -> Result<()> {
+    let Summary {
+        window_s,
+        services,
+        by_method,
+        cpu,
+        over_ns,
+        counters,
+        slow,
+        listed,
+    } = *summary;
     if opt.json {
-        let usage = usage.sample()?;
-        let inbox = inbox.borrow();
+        let agent = end.map(|end| (end.cpu_percent, end.rss_bytes));
         print_json_summaries(
-            None,
-            &aggregate(&read_groups(skel)?, &mut resolver),
-            inbox.methods.total(),
-            &mut resolver,
-            (&cpu, over_ns),
-            json::health(
-                None,
-                &counters,
-                slow,
-                shown,
-                Some((usage.cpu_percent, usage.rss_bytes)),
-            ),
+            window_s,
+            services,
+            by_method,
+            resolver,
+            (cpu, over_ns),
+            json::health(window_s, counters, slow, listed, agent),
         );
         return Ok(());
     }
-    println!("\n--- slow (final) ---");
-    print!(
-        "{}",
-        render_services(&aggregate(&read_groups(skel)?, &mut resolver), opt.rows)
-    );
-    print!(
-        "{}",
-        render_methods(inbox.borrow().methods.total(), &mut resolver, &opt)
-    );
-    print!("{}", render_cpu(&cpu, over_ns, &opt));
-    println!("  {}", request_line(&counters, shown));
-    if slow > shown {
-        println!("  listed  the {shown} slowest of {slow} slow requests (--list)");
+    match window_s {
+        Some(secs) => println!("--- slow (window {secs}s) ---"),
+        None => println!("\n--- slow (final) ---"),
     }
-    println!("  {}", kernel_line(&counters));
-    if inbox.borrow().rejected > 0 {
-        println!("  agent   rejected_records={} (!)", inbox.borrow().rejected);
+    print!("{}", render_services(services, opt.rows));
+    print!("{}", render_methods(by_method, resolver, opt));
+    print!("{}", render_cpu(cpu, over_ns, opt));
+    if end.is_some() {
+        println!("  {}", request_line(counters, listed));
+        if slow > listed {
+            println!("  listed  the {listed} slowest of {slow} slow requests (--list)");
+        }
     }
-    print_bpf_cost(skel, elapsed, counters.get(Counter::ReqFinished))?;
-    let usage = usage.sample()?;
-    println!(
-        "  self    cpu={:.2}%  rss={}",
-        usage.cpu_percent,
-        human_bytes(usage.rss_bytes)
-    );
+    println!("  {}", kernel_line(counters));
+    if let Some(end) = end {
+        if end.rejected > 0 {
+            println!("  agent   rejected_records={} (!)", end.rejected);
+        }
+        print_bpf_cost(skel, end.elapsed, counters.get(Counter::ReqFinished))?;
+        println!(
+            "  self    cpu={:.2}%  rss={}",
+            end.cpu_percent,
+            human_bytes(end.rss_bytes)
+        );
+    }
     Ok(())
 }
 
