@@ -1,30 +1,31 @@
-//! Loading the kernel side, and finding out about each traced process:
-//! its runtime, the probes its attribution needs, what to tell the user.
+//! Loading the kernel side and attaching it: which programs load, how the
+//! tables are sized, the order programs are attached in, and starting to
+//! trace the processes there are (`process.rs` looks at each of them,
+//! `fsvc.rs` decides the file-service hooks).
 
-use std::{
-    cell::RefCell, collections::HashSet, os::fd::OwnedFd, path::Path, ptr::NonNull, sync::OnceLock,
-};
+use std::{cell::RefCell, os::fd::OwnedFd, path::Path, ptr::NonNull};
 
 use anyhow::{Context as _, Result, bail};
-use blame_common::ProcCfg;
 use libbpf_rs::{
     AsRawLibbpf as _, Link, MapCore, MapFlags,
     skel::{OpenSkel as _, Skel as _},
 };
 
+use super::{
+    SlowOpt,
+    fsvc::{FSVC_PREFIX, attach_fsvc, fsvc_function, fsvc_present},
+    process::{ProcessNote, inspect_and_attach},
+};
 use crate::{
     bpf::{self, Skel},
-    json, procfs,
-    runtime::{self, Inspected, Probe, ProbeAt},
+    procfs,
 };
-
-use super::SlowOpt;
 
 /// The request programs all carry this prefix.
 pub(super) const PROGRAM_PREFIX: &str = "req_";
 
 /// Programs attached to functions of a traced process's binary carry this
-/// one: loaded with the rest, attached per process (`attach_probes`).
+/// one: loaded with the rest, attached per process (`process.rs`).
 const PROBE_PREFIX: &str = "up_";
 
 /// The ring buffer for `blame slow`. Every header block of every HTTP/2
@@ -54,155 +55,9 @@ pub(super) struct Attached {
     pub(super) table_bytes: u64,
 }
 
-/// What was found out about one traced process, for the user.
-pub(super) struct ProcessNote {
-    pid: u32,
-    /// What its requests' time is attributed by.
-    units: &'static str,
-    /// Probes that find the handler of each HTTP/2 stream are attached.
-    http2_handlers_followed: bool,
-    note: Option<String>,
-    /// Versions blame does not know (`Inspected::unsupported`).
-    unsupported: Vec<String>,
-}
-
-impl ProcessNote {
-    pub(super) fn of(pid: u32, found: &Inspected) -> Self {
-        Self {
-            pid,
-            units: match found.cfg.runtime {
-                blame_common::RT_GO => "goroutine",
-                blame_common::RT_TOKIO => "task",
-                _ => "thread",
-            },
-            http2_handlers_followed: found.http2_handlers,
-            note: found.note.clone(),
-            unsupported: found.unsupported.clone(),
-        }
-    }
-
-    /// Tell the user: a line, or a record. Plain threaded processes with
-    /// nothing to say are only mentioned as records.
-    pub(super) fn print(&self, opt: &SlowOpt) {
-        // On stderr in both modes: easy to miss among the records otherwise.
-        for warning in &self.unsupported {
-            eprintln!("blame: warning: pid {}: {warning}", self.pid);
-        }
-        if opt.json {
-            println!(
-                "{}",
-                json::process(
-                    self.pid,
-                    self.units,
-                    self.http2_handlers_followed,
-                    self.note.as_deref(),
-                    &self.unsupported
-                )
-            );
-        } else if let Some(note) = &self.note {
-            println!("blame: pid {}: {note}", self.pid);
-        }
-    }
-}
-
 fn is_request_program(name: &std::ffi::OsStr) -> bool {
     name.to_string_lossy().starts_with(PROGRAM_PREFIX)
 }
-
-/// The programs on the functions where a thread waits for a file service
-/// (`bpf/request/fsvc.h`): `req_fsvc_<function>` at entry, `req_fsvcx_<function>`
-/// at return. Attached by `attach_fsvc`, before the other request programs.
-const FSVC_PREFIX: &str = "req_fsvc";
-
-/// The kernel function a file-service program is on.
-fn fsvc_function(name: &str) -> Option<&str> {
-    name.strip_prefix("req_fsvcx_")
-        .or_else(|| name.strip_prefix("req_fsvc_"))
-}
-
-/// The module a file-service function is in, when not in the kernel proper.
-/// An fentry program on a function of a module that is not loaded does not
-/// load, so it is left out; the module's waits are then counted as the
-/// kernel marks them.
-fn fsvc_module(function: &str) -> Option<&'static str> {
-    if function.starts_with("rpc_") {
-        Some("sunrpc")
-    } else if function.starts_with("nfs_") {
-        Some("nfs")
-    } else if function.starts_with("fuse_") || function == "request_wait_answer" {
-        Some("fuse")
-    } else if function.starts_with("cifs_") {
-        Some("cifs")
-    } else if function.starts_with("v9fs_") {
-        Some("9p")
-    } else if function.starts_with("ceph_") {
-        Some("ceph")
-    } else {
-        None
-    }
-}
-
-/// Whether a file-service program on `function` can load: its function is
-/// one ftrace can hook. A static function the compiler inlined into all its
-/// callers has no entry of its own, in a loaded module too (WSL2's 6.6 for
-/// x86-64: sunrpc's rpc_wait_bit_killable and nfs's nfs_direct_wait), and a
-/// program on it fails the load of every file-service program.
-///
-/// Without ftrace's list (tracefs is not mounted in a container unless it
-/// is given), the function must be in the kernel's symbols, which an
-/// inlined one is not. Not its BTF: rpc_wait_bit_killable has an entry in
-/// sunrpc's, and no code. Without either, its module must be loaded.
-fn fsvc_present(function: &str) -> bool {
-    if let Some(traceable) = traceable_functions() {
-        return traceable.contains(function);
-    }
-    if let Some(symbols) = kernel_functions() {
-        return symbols.contains(function);
-    }
-    fsvc_module(function).is_none_or(|module| Path::new("/sys/module").join(module).exists())
-}
-
-/// The kernel's functions, loaded modules' included (`/proc/kallsyms`, its
-/// text symbols); read once. `None` if it cannot be read.
-fn kernel_functions() -> Option<&'static HashSet<String>> {
-    static FUNCTIONS: OnceLock<Option<HashSet<String>>> = OnceLock::new();
-    FUNCTIONS
-        .get_or_init(|| {
-            std::fs::read_to_string("/proc/kallsyms")
-                .ok()
-                .map(|text| kallsyms_functions(&text))
-        })
-        .as_ref()
-}
-
-/// The text symbols in the text of `/proc/kallsyms`: `address type name`,
-/// and a module's tab-separated `[module]` after.
-fn kallsyms_functions(text: &str) -> HashSet<String> {
-    text.lines()
-        .filter_map(|line| {
-            let mut fields = line.split_whitespace();
-            let (_, kind, name) = (fields.next()?, fields.next()?, fields.next()?);
-            matches!(kind, "t" | "T").then(|| name.to_string())
-        })
-        .collect()
-}
-
-/// The functions ftrace can hook now (`available_filter_functions`), loaded
-/// modules' included; read once. `None` if tracefs cannot be read.
-fn traceable_functions() -> Option<&'static HashSet<String>> {
-    static TRACEABLE: OnceLock<Option<HashSet<String>>> = OnceLock::new();
-    TRACEABLE
-        .get_or_init(|| {
-            ["/sys/kernel/tracing", "/sys/kernel/debug/tracing"]
-                .iter()
-                .find_map(|dir| {
-                    std::fs::read_to_string(Path::new(dir).join("available_filter_functions")).ok()
-                })
-                .map(|text| filter_functions(&text))
-        })
-        .as_ref()
-}
-
 /// What to say about a program that would not attach when tracefs is not
 /// mounted: libbpf finds a tracepoint's id there, and a container has it
 /// only when given it.
@@ -222,20 +77,11 @@ fn tracefs_hint() -> &'static str {
     }
 }
 
-/// The names in the text of `available_filter_functions`: one a line, a
-/// module's followed by `[module]`.
-fn filter_functions(text: &str) -> HashSet<String> {
-    text.lines()
-        .filter_map(|line| line.split_whitespace().next())
-        .map(str::to_string)
-        .collect()
-}
-
 /// Attach programs all at once, a thread each. One after the other, the
 /// first fentry or fexit program on each function takes some 110 ms (the
 /// file-service hooks: about 1.2 s); together, some 150 ms (355 ms with a
 /// busy process traced). Each program's own error, or its link.
-fn attach_together(
+pub(super) fn attach_together(
     programs: Vec<(String, NonNull<libbpf_sys::bpf_program>)>,
 ) -> Vec<(String, Result<Link>)> {
     struct Prog(NonNull<libbpf_sys::bpf_program>);
@@ -278,7 +124,7 @@ fn attach_together(
 /// every later wakeup on that CPU came from. So returns first (0), then the
 /// entries of functions (1), which only mark: by the time the programs that
 /// follow requests are on (2), what they read is kept up to date.
-fn attach_rank(name: &str, program: NonNull<libbpf_sys::bpf_program>) -> u8 {
+pub(super) fn attach_rank(name: &str, program: NonNull<libbpf_sys::bpf_program>) -> u8 {
     // SAFETY: a loaded program of the object.
     let attach_type = unsafe { libbpf_sys::bpf_program__expected_attach_type(program.as_ptr()) };
     if attach_type == libbpf_sys::BPF_TRACE_FEXIT || name.starts_with("req_exit_") {
@@ -291,7 +137,7 @@ fn attach_rank(name: &str, program: NonNull<libbpf_sys::bpf_program>) -> u8 {
 }
 
 /// The loaded programs whose name passes `wanted`.
-fn loaded(
+pub(super) fn loaded(
     skel: &Skel,
     wanted: impl Fn(&str) -> bool,
 ) -> Vec<(String, NonNull<libbpf_sys::bpf_program>)> {
@@ -305,300 +151,8 @@ fn loaded(
         .collect()
 }
 
-/// Attach the file-service programs that were loaded. Without any, such
-/// waits are counted as the kernel marks them (disk, or other): said on
-/// stderr, and the rest goes on.
-fn attach_fsvc(skel: &Skel) -> Vec<Link> {
-    let mut links = Vec::new();
-    let mut last_err = None;
-    // Returns before entries (see `attach_rank`), each kind together.
-    let (returns, entries): (Vec<_>, Vec<_>) = loaded(skel, |name| name.starts_with(FSVC_PREFIX))
-        .into_iter()
-        .partition(|(name, program)| attach_rank(name, *program) == 0);
-    let attached = attach_together(returns)
-        .into_iter()
-        .chain(attach_together(entries));
-    for (name, link) in attached {
-        match link {
-            Ok(link) => links.push(link),
-            Err(err) => last_err = Some(format!("{name}: {err}")),
-        }
-    }
-    if links.is_empty() || last_err.is_some() {
-        eprintln!(
-            "blame: waits for a file service (NFS, FUSE, ...) are not all told apart from disk \
-             waits: {}",
-            last_err.unwrap_or_else(|| "no function to hook".into())
-        );
-    }
-    links
-}
-
 fn is_probe_program(name: &std::ffi::OsStr) -> bool {
     name.to_string_lossy().starts_with(PROBE_PREFIX)
-}
-
-/// Attach the probes a process's attribution relies on: all of them, or
-/// none. The binary is reached through `/proc/<pid>/exe`, which works in
-/// whatever mount namespace it lives.
-fn attach_probes(skel: &Skel, pid: u32, probes: &[Probe]) -> Result<Vec<Link>> {
-    let binary = format!("/proc/{pid}/exe");
-    let mut links = Vec::new();
-    for probe in probes {
-        let offset = usize::try_from(probe.offset).context("probe offset")?;
-        let mut at = |program: &libbpf_rs::ProgramMut<'_>, ret: bool| -> Result<()> {
-            links.push(
-                program
-                    .attach_uprobe(ret, pid as i32, &binary, offset)
-                    .with_context(|| format!("probe {:?} at {offset:#x}", probe.at))?,
-            );
-            Ok(())
-        };
-        let progs = &skel.progs;
-        match probe.at {
-            ProbeAt::GoExecute => at(&progs.up_go_execute, false)?,
-            ProbeAt::GoGrpcConn => at(&progs.up_go_grpc_conn, false)?,
-            ProbeAt::GoGrpcHandle => at(&progs.up_go_grpc_handle, false)?,
-            ProbeAt::GoGrpcEnd => at(&progs.up_go_grpc_end, false)?,
-            ProbeAt::GoGrpcHeaders => at(&progs.up_go_grpc_headers, false)?,
-            ProbeAt::TokioSpawn => at(&progs.up_tokio_spawn, false)?,
-            ProbeAt::TokioSpawnBlocking => at(&progs.up_tokio_spawn_blocking, false)?,
-            ProbeAt::GoPark => at(&progs.up_go_park, false)?,
-            ProbeAt::GoExit => at(&progs.up_go_exit, false)?,
-            ProbeAt::GoSpawn => {
-                at(&progs.up_go_newproc, false)?;
-                at(&progs.up_go_newproc_ret, true)?;
-            }
-            ProbeAt::RsRecvHeaders => at(&progs.up_rs_recv_headers, false)?,
-            ProbeAt::RsSend => at(&progs.up_rs_send, false)?,
-            ProbeAt::TokioPoll => {
-                at(&progs.up_tokio_poll, false)?;
-                at(&progs.up_tokio_poll_ret, true)?;
-            }
-            ProbeAt::TokioPollBlocking => {
-                at(&progs.up_tokio_poll_blocking, false)?;
-                at(&progs.up_tokio_poll_blocking_ret, true)?;
-            }
-            ProbeAt::TokioWake => at(&progs.up_tokio_wake, false)?,
-            ProbeAt::TokioIoTurn => {
-                at(&progs.up_tokio_io_turn, false)?;
-                at(&progs.up_tokio_io_turn_ret, true)?;
-            }
-            ProbeAt::TokioTimers => {
-                at(&progs.up_tokio_timers, false)?;
-                at(&progs.up_tokio_timers_ret, true)?;
-            }
-        }
-    }
-    Ok(links)
-}
-
-/// Look at a process and attach what its attribution needs. If the probes
-/// cannot be attached, the process is attributed without them.
-/// The most open files the agent asks for. Every probe in a process is a
-/// link that holds a file descriptor: tokio's `poll` has one instance per
-/// task type, 278 of them in Qdrant, entry and return each, so the usual soft
-/// limit of 1024 is not enough for a big binary.
-const OPEN_FILES_WANTED: libc::rlim_t = 1 << 20;
-
-/// Raise the soft limit on open files to what the hard limit allows (up to
-/// `OPEN_FILES_WANTED`). Returns the limit in force afterwards.
-pub(super) fn raise_open_files_limit() -> libc::rlim_t {
-    let mut limit = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-    // SAFETY: `limit` is a valid rlimit for the calls to write and read.
-    unsafe {
-        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 {
-            return 0;
-        }
-        let wanted = limit.rlim_max.min(OPEN_FILES_WANTED);
-        if limit.rlim_cur < wanted {
-            let raised = libc::rlimit {
-                rlim_cur: wanted,
-                rlim_max: limit.rlim_max,
-            };
-            if libc::setrlimit(libc::RLIMIT_NOFILE, &raised) == 0 {
-                limit.rlim_cur = wanted;
-            }
-        }
-    }
-    limit.rlim_cur
-}
-
-/// What to add to a failure to attach: too many open files is the one a user
-/// can do something about.
-fn attach_hint(err: &str) -> &'static str {
-    if err.contains("Too many open files") {
-        " (the limit on open files is too low for this binary: raise it with `ulimit -n`, as root also the hard limit)"
-    } else {
-        ""
-    }
-}
-
-/// With `--deep`, in a process attributed by thread that has loaded GNU's
-/// OpenMP runtime: probes where it opens parallel regions, so that the
-/// threads of a team that take up a request's work are followed
-/// (`bpf/runtime/omp.h`). All of them, or none.
-fn follow_openmp(skel: &Skel, opt: &SlowOpt, pid: u32, found: &mut Inspected) -> Vec<Link> {
-    if !opt.deep || found.cfg != ProcCfg::threads() || found.note.is_some() {
-        return Vec::new();
-    }
-    let proc = Path::new("/proc");
-    let Some(lib) = runtime::omp::libgomp(proc, pid) else {
-        return Vec::new();
-    };
-    let file = runtime::omp::file_of(proc, pid, &lib.path);
-    let mut links = Vec::new();
-    for offset in &lib.entries {
-        let Ok(offset) = usize::try_from(*offset) else {
-            return Vec::new();
-        };
-        let progs = &skel.progs;
-        for (program, ret) in [
-            (&progs.up_omp_parallel, false),
-            (&progs.up_omp_parallel_ret, true),
-        ] {
-            match program.attach_uprobe(ret, pid as i32, &file, offset) {
-                Ok(link) => links.push(link),
-                Err(err) => {
-                    let text = format!("{err:#}");
-                    eprintln!(
-                        "blame: pid {pid}: OpenMP teams not followed: probe in {} at {offset:#x}: {text}{}",
-                        lib.path,
-                        attach_hint(&text)
-                    );
-                    return Vec::new();
-                }
-            }
-        }
-    }
-    found.note = Some(
-        "OpenMP (libgomp): the threads that take up a request's parallel work are followed"
-            .to_owned(),
-    );
-    links
-}
-
-/// Functions of parallel regions the kernel side has seen run for a request
-/// and that have no probes yet: put them there, and say so. A function is
-/// known by its address in the process only.
-pub(super) fn follow_openmp_functions(attached: &Attached) {
-    let fns = &attached.skel.maps.OMP_FNS;
-    let proc = Path::new("/proc");
-    for key in fns.keys() {
-        // OMP_FN_NEW.
-        if !matches!(fns.lookup(&key, MapFlags::ANY), Ok(Some(value)) if value.first() == Some(&0))
-        {
-            continue;
-        }
-        let (Some(addr), Some(pid)) = (
-            key.get(..8)
-                .and_then(|b| b.try_into().ok())
-                .map(u64::from_ne_bytes),
-            key.get(8..12)
-                .and_then(|b| b.try_into().ok())
-                .map(u32::from_ne_bytes),
-        ) else {
-            continue;
-        };
-        let progs = &attached.skel.progs;
-        let attach = || -> Result<Vec<Link>> {
-            let (path, offset) = runtime::omp::locate(proc, pid, addr)
-                .with_context(|| format!("{addr:#x} is in no file the process maps"))?;
-            let file = runtime::omp::file_of(proc, pid, &path);
-            let offset = usize::try_from(offset).context("probe offset")?;
-            Ok(vec![
-                progs
-                    .up_omp_fn_ret
-                    .attach_uprobe(true, pid as i32, &file, offset)
-                    .with_context(|| format!("probe in {path} at {offset:#x}"))?,
-                progs
-                    .up_omp_fn
-                    .attach_uprobe(false, pid as i32, &file, offset)
-                    .with_context(|| format!("probe in {path} at {offset:#x}"))?,
-            ])
-        };
-        // OMP_FN_PROBED, or OMP_FN_FAILED.
-        let state = match attach() {
-            Ok(links) => {
-                attached.probe_links.borrow_mut().extend(links);
-                1u8
-            }
-            Err(err) => {
-                let text = format!("{err:#}");
-                eprintln!(
-                    "blame: pid {pid}: an OpenMP region's function is not followed: {text}{}",
-                    attach_hint(&text)
-                );
-                2u8
-            }
-        };
-        // The process may be gone: then there is nothing to tell.
-        let _ = fns.update(&key, &[state], MapFlags::EXIST);
-    }
-}
-
-fn inspect_and_attach(skel: &Skel, opt: &SlowOpt, pid: u32) -> (Inspected, Vec<Link>) {
-    let mut found = inspect(opt, pid);
-    if found.probes.is_empty() {
-        let links = follow_openmp(skel, opt, pid, &mut found);
-        return (found, links);
-    }
-    // The tables the probes look things up in go first: a probe that fires
-    // before they are there would take the runtime's own goroutines for a
-    // request's, or every park for one of another kind.
-    if let Err(err) = write_spawn_skip(skel, pid, &found.spawn_skip)
-        .and_then(|()| write_go_wait_kinds(skel, pid, &found.go_wait_kinds))
-        && let Some(note) = &mut found.note
-    {
-        note.push_str(&format!(" (tables not written, so not exact: {err:#})"));
-    }
-    match attach_probes(skel, pid, &found.probes) {
-        Ok(links) => (found, links),
-        Err(err) => {
-            let text = format!("{err:#}");
-            eprintln!("blame: pid {pid}: {text}{}", attach_hint(&text));
-            (found.without_probes(), Vec::new())
-        }
-    }
-}
-
-/// Tell the kernel side what each Go wait reason of `pid` is.
-fn write_go_wait_kinds(skel: &Skel, pid: u32, kinds: &[u8]) -> Result<()> {
-    for (reason, &kind) in kinds.iter().enumerate() {
-        let mut key = [0u8; 8];
-        key[..4].copy_from_slice(&pid.to_ne_bytes());
-        key[4..].copy_from_slice(&(reason as u32).to_ne_bytes());
-        skel.maps
-            .GO_WAIT_KIND
-            .update(&key, &[kind], MapFlags::ANY)
-            .context("the table of Go wait reasons is full")?;
-    }
-    Ok(())
-}
-
-/// Tell the kernel side which goroutine starts of `pid` are the runtime's
-/// own (see [`runtime::Inspected::spawn_skip`]).
-fn write_spawn_skip(skel: &Skel, pid: u32, skip: &[u64]) -> Result<()> {
-    let Some((&newproc, starts)) = skip.split_first() else {
-        return Ok(());
-    };
-    for &addr in starts {
-        let mut key = [0u8; 16];
-        key[..8].copy_from_slice(&addr.to_ne_bytes());
-        key[8..12].copy_from_slice(&pid.to_ne_bytes());
-        skel.maps
-            .SPAWN_SKIP
-            .update(&key, &[1], MapFlags::ANY)
-            .context("the table of the runtime's goroutines is full")?;
-    }
-    skel.maps
-        .SPAWN_BASE
-        .update(&pid.to_ne_bytes(), &newproc.to_ne_bytes(), MapFlags::ANY)
-        .context("SPAWN_BASE")?;
-    Ok(())
 }
 
 /// The per-process CPU table: entries per CPU, and at least this many.
@@ -796,61 +350,6 @@ pub(super) fn attach(opt: &SlowOpt) -> Result<Attached> {
     })
 }
 
-fn inspect(opt: &SlowOpt, pid: u32) -> Inspected {
-    if opt.threads_only {
-        Inspected {
-            cfg: ProcCfg::threads(),
-            note: None,
-            probes: Vec::new(),
-            fallback: None,
-            spawn_skip: Vec::new(),
-            go_wait_kinds: Vec::new(),
-            http2_handlers: false,
-            unsupported: Vec::new(),
-        }
-    } else {
-        runtime::inspect(Path::new("/proc"), pid, opt.deep)
-    }
-}
-
-/// Processes the kernel side started tracing on its own (they accepted a
-/// connection) have not been looked at: do that, and tell the kernel side.
-pub(super) fn inspect_new_processes(attached: &Attached, opt: &SlowOpt) {
-    let procs = &attached.skel.maps.REQ_PROCS;
-    let mut changed = false;
-    for key in procs.keys() {
-        let Ok(Some(value)) = procs.lookup(&key, MapFlags::ANY) else {
-            continue;
-        };
-        // Byte 0 is the runtime; 0 = not looked at.
-        if value.first() != Some(&0) {
-            continue;
-        }
-        let Ok(pid) = key.as_slice().try_into().map(u32::from_ne_bytes) else {
-            continue;
-        };
-        let (found, links) = inspect_and_attach(&attached.skel, opt, pid);
-        attached.probe_links.borrow_mut().extend(links);
-        // Only if the process is still there: it may have exited meanwhile.
-        if procs
-            .update(&key, &found.cfg.to_bytes(), MapFlags::EXIST)
-            .is_ok()
-        {
-            changed = true;
-            ProcessNote::of(pid, &found).print(opt);
-        }
-    }
-    if changed {
-        // SAFETY: points into the object's mapped data, which lives as long
-        // as the process; the kernel side only reads it.
-        unsafe {
-            attached
-                .rt_gen
-                .write_volatile(attached.rt_gen.read_volatile().wrapping_add(1))
-        };
-    }
-}
-
 /// A `--pid` must name a running process, not one of its threads: requests
 /// are traced per process.
 fn check_process(proc: &Path, pid: u32) -> Result<()> {
@@ -885,58 +384,6 @@ fn kernel_at_least(release: &str, min: (u32, u32)) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn traceable_functions_are_read_with_their_modules_left_off() {
-        let text = "filemap_fault\nnfs_file_read [nfs]\nrpc_exit_task [sunrpc]\n";
-        let names = filter_functions(text);
-        assert!(names.contains("filemap_fault"));
-        assert!(names.contains("nfs_file_read"));
-        // Inlined into its callers: not in the list, not hooked.
-        assert!(!names.contains("rpc_wait_bit_killable"));
-        assert!(!names.contains("[nfs]"));
-    }
-
-    #[test]
-    fn kernel_functions_are_the_text_symbols() {
-        let text = "ffffffffa4357ff0 T filemap_fault\n\
-                    ffffffffc0a1b2c0 t nfs_file_read\t[nfs]\n\
-                    ffffffffa5000000 D jiffies\n";
-        let names = kallsyms_functions(text);
-        assert!(names.contains("filemap_fault"));
-        assert!(names.contains("nfs_file_read"));
-        assert!(!names.contains("jiffies"));
-        assert!(!names.contains("rpc_wait_bit_killable"));
-    }
-
-    #[test]
-    fn the_open_files_limit_is_raised_as_far_as_it_may_be() {
-        let now = raise_open_files_limit();
-        let mut limit = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        // SAFETY: `limit` is a valid rlimit to write.
-        assert_eq!(
-            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
-            0
-        );
-        assert_eq!(limit.rlim_cur, now);
-        assert_eq!(limit.rlim_cur, limit.rlim_max.min(OPEN_FILES_WANTED));
-        // Asking again changes nothing.
-        assert_eq!(raise_open_files_limit(), now);
-    }
-
-    #[test]
-    fn a_failure_for_too_many_open_files_says_what_to_do() {
-        assert!(
-            attach_hint(
-                "probe TokioPoll at 0x1: failed to attach uprobe: Too many open files (os error 24)"
-            )
-            .contains("ulimit -n")
-        );
-        assert_eq!(attach_hint("probe TokioPoll at 0x1: no such file"), "");
-    }
 
     #[test]
     fn kernel_release_is_compared_by_major_and_minor() {

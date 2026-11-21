@@ -2,8 +2,10 @@
 //! time of the threads serving them went.
 
 mod attach;
+mod fsvc;
 mod inbox;
 pub(crate) mod proc_cpu;
+mod process;
 mod render;
 mod summary;
 
@@ -30,8 +32,9 @@ use crate::{
     stats::{Counters, UsageTracker, human_bytes},
 };
 
-use attach::{attach, follow_openmp_functions, inspect_new_processes, raise_open_files_limit};
+use attach::attach;
 use inbox::{Inbox, Slowest, place_stream_ids, receive};
+use process::{follow_openmp_functions, inspect_new_processes, raise_open_files_limit};
 use render::{fmt_ns, render_raw, render_request};
 use summary::{aggregate, kernel_line, print_bpf_cost, read_groups, render_services, request_line};
 
