@@ -95,6 +95,8 @@ pub fn process_cpu(window_s: Option<u64>, pid: u32, over_ns: u64, cpu: &ProcCpu)
         "runq_cpu_limit_ns": cpu.runq_cpu_limit_ns,
         "runq_others_ns": cpu.runq_others_ns,
         "runq_cpu_idle_ns": cpu.runq_cpu_idle_ns,
+        "steal_ns": cpu.steal_ns,
+        "cgroup_throttled_ns": cpu.cgroup_throttled_ns,
     })
 }
 
@@ -460,10 +462,12 @@ pub fn fields() -> Value {
                 "window_s": "As in `service`.",
                 "pid": "The process.",
                 "over_ns": "The time the figures cover: the window, or since the agent started. A process first seen later is covered from then.",
-                "runq_own_threads_ns": "Its threads runnable and waiting for a CPU while another thread of the same process ran on the CPU they were queued on: the process had more to run than CPUs to run it on. This and the three below add up to all its threads waited.",
+                "runq_own_threads_ns": "Its threads runnable and waiting for a CPU while another thread of the same process ran on the CPU they were queued on. That is all it says: other CPUs may have been idle meanwhile (threads kept to too few CPUs, load balancing not caught up yet, more Go threads allowed than CPUs), so it is not by itself a shortage of CPUs. Interrupts handled meanwhile are in it. This and the three below add up to all its threads waited.",
                 "runq_cpu_limit_ns": "The same while a CPU limit of their control group, or of one above it, kept them off the CPU (the kernel's own count of the time the group's queue on that CPU was throttled with threads in it): the limit was used up. The CPU may have been idle meanwhile, or run something else. null on a kernel that does not keep that count (before 6.6, or without group scheduling); such a wait is then in the two below.",
-                "runq_others_ns": "The same, outside a limit, while something else ran on that CPU: a thread of another process, or of the kernel. The CPU was taken from the process. Other processes of the same service are others here.",
-                "runq_cpu_idle_ns": "The same, outside a limit, while that CPU was idle: a wait counts from the wakeup, and an idle CPU takes a while to be woken and to take the thread. Nothing had the CPU.",
+                "runq_others_ns": "The same, outside a limit, while something else ran on that CPU: a thread of another process, or of the kernel (ksoftirqd among them). The CPU was taken from the process. Other processes of the same service are others here. Interrupts handled meanwhile are in it.",
+                "runq_cpu_idle_ns": "The same, outside a limit, while that CPU ran nothing but its idle task: a wait counts from the wakeup, and an idle CPU takes a while to be woken and to take the thread; interrupts the CPU handled while idle (a busy network's, say) are in it too. No thread had the CPU.",
+                "steal_ns": "What the hypervisor took from the CPUs its threads ran or waited on (`steal` in /proc/stat), summed over those CPUs, at the resolution of clock ticks. Not split from the four above: a stolen stretch is in whichever of them the CPU was in. 0 also where the hypervisor does not say.",
+                "cgroup_throttled_ns": "The most any of its control groups (its own and those above it, cgroup v2) was throttled by a CPU limit, from their cpu.stat (`throttled_usec`): the group's time, not its threads'. Where the kernel does not say what of the threads' waits a limit caused (`runq_cpu_limit_ns` null), this is what says a limit was hit. null if no such figure could be read.",
             },
             "health": {
                 "about": "How complete the other records are.",

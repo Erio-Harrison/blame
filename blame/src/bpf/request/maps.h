@@ -518,6 +518,10 @@ struct proc_cpu {
 	u64 wait_idle_ns;
 };
 
+/*
+ * Sized by user space for the machine's CPUs (slow/attach.rs), which also
+ * removes the entries of processes that are gone once it has read them.
+ */
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 16384);

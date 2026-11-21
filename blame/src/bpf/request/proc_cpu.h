@@ -54,8 +54,11 @@ static __always_inline struct proc_cpu *proc_cpu_at(u32 tgid, u32 cpu, bool crea
 	if (!pc && create) {
 		struct proc_cpu zero = {};
 
+		/* Another CPU may have made it meanwhile: only a lookup tells. */
 		bpf_map_update_elem(&PROC_CPU, &key, &zero, BPF_NOEXIST);
 		pc = bpf_map_lookup_elem(&PROC_CPU, &key);
+		if (!pc)
+			bump(PROC_CPU_INSERT_FAILED);
 	}
 	return pc;
 }

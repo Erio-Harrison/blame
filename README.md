@@ -68,14 +68,22 @@ thread pools of other kinds (ONNX Runtime's: there, one thread per request,
 `intra_op_num_threads=1`, is what is exact).
 With the summaries comes, per traced process, what all its threads waited
 for a CPU, in four parts by what the CPU they were queued on did meanwhile:
-its own threads had it (it had more to run than CPUs); a CPU limit of its
-control group kept them off it (a container's, say: the kernel's own count,
-kernels from 6.6); something else ran on it (the CPU was taken from the
-process); it was idle (a wait counts from the wakeup, and an idle CPU takes
-a while to be woken). That is where a Go or tokio service robbed of its CPU,
-or out of its limit, shows: a request's own wait for a CPU stays near zero
-there, because the runtime's thread that could not run was not yet working
-for it, and the request only waits longer on a channel or a lock
+another of its own threads ran on it; a CPU limit of its control group kept
+them off it (a container's, say: the kernel's own count, kernels from 6.6);
+something else ran on it (the CPU was taken from the process); it ran
+nothing but its idle task (a wait counts from the wakeup, and an idle CPU
+takes a while to be woken). "Its own threads" says no more than that: other
+CPUs may have been idle meanwhile, with threads kept to too few CPUs or more
+Go threads allowed than CPUs, so it is not by itself a shortage of CPUs.
+Interrupts are not a part of their own: they are in whichever part the CPU
+was in when it handled them, "idle" included. Next to the four: what the
+hypervisor took from the CPUs the process used (steal, as `/proc/stat` says
+it; 0 also where the hypervisor does not say), and the most its control
+groups were throttled by a CPU limit (`cpu.stat`), which is what tells of a
+limit on kernels older than 6.6. That is where a Go or tokio service robbed
+of its CPU, or out of its limit, shows: a request's own wait for a CPU stays
+near zero there, because the runtime's thread that could not run was not yet
+working for it, and the request only waits longer on a channel or a lock
 (`examples/pay-demo`). The figures are the process's, not divided among
 requests; another process of the same service is "something else".
 A request's `on_cpu` is all the time its thread, goroutine or task was on a

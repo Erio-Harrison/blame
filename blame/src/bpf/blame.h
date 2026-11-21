@@ -492,7 +492,12 @@ enum counter {
 	 * charged to no request.
 	 */
 	OMP_TEAM_IDLE_CPU_NS = 34,
-	COUNTER_MAX = 35,
+	/*
+	 * A traced process's figures on a CPU had no room in PROC_CPU: its
+	 * threads' waits there, and what they ran there, are not counted.
+	 */
+	PROC_CPU_INSERT_FAILED = 35,
+	COUNTER_MAX = 36,
 };
 
 struct runq_hist {

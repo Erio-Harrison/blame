@@ -120,6 +120,7 @@ pub(super) fn kernel_line(counters: &Counters) -> String {
         Counter::ReqH2Lost,
         Counter::ReqStreamInsertFailed,
         Counter::GrpcHandoffUnmatched,
+        Counter::ProcCpuInsertFailed,
         Counter::RingbufFull,
     ]
     .into_iter()

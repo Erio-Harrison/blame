@@ -601,6 +601,10 @@ fn write_spawn_skip(skel: &Skel, pid: u32, skip: &[u64]) -> Result<()> {
     Ok(())
 }
 
+/// The per-process CPU table: entries per CPU, and at least this many.
+const PROC_CPU_PER_CPU: u32 = 256;
+const PROC_CPU_MIN: u32 = 16384;
+
 /// Open, size and load the programs of `slow`, with the file-service hooks
 /// or without them.
 fn load_programs(opt: &SlowOpt, fsvc: bool) -> Result<Skel> {
@@ -635,6 +639,15 @@ fn load_programs(opt: &SlowOpt, fsvc: bool) -> Result<Skel> {
     if let Some(entries) = opt.max_requests {
         open.maps.REQ_TABLE.set_max_entries(entries)?;
     }
+    // One entry per traced process and CPU it uses: room for 256 processes
+    // on every CPU. Entries of processes that are gone are removed as they
+    // are read (proc_cpu.rs).
+    let cpus = u32::try_from(libbpf_rs::num_possible_cpus().context("counting the CPUs")?)
+        .unwrap_or(u32::MAX);
+    open.maps
+        .PROC_CPU
+        .set_max_entries(PROC_CPU_MIN.max(cpus.saturating_mul(PROC_CPU_PER_CPU)))
+        .context("sizing the per-process CPU table")?;
     bpf::load(open)
 }
 

@@ -177,7 +177,9 @@ pub async fn run(opt: SlowOpt) -> Result<()> {
     let mut look = tokio::time::interval(INSPECT_EVERY);
 
     let mut previous: HashMap<u64, Hist> = HashMap::new();
-    let mut previous_cpu = std::collections::BTreeMap::new();
+    // The first read is where steal and cgroup throttling are counted from.
+    let mut cpu_tracker = proc_cpu::Tracker::default();
+    let mut previous_cpu = cpu_tracker.read(skel)?;
     let mut window_started = Instant::now();
     loop {
         tokio::select! {
@@ -208,7 +210,7 @@ pub async fn run(opt: SlowOpt) -> Result<()> {
                 let services = aggregate(&window, &mut resolver);
                 let by_method = inbox.borrow_mut().methods.take_window();
                 let counters = Counters::read(skel)?;
-                let cpu_now = proc_cpu::read(skel)?;
+                let cpu_now = cpu_tracker.read(skel)?;
                 let cpu = proc_cpu::window(&cpu_now, &previous_cpu);
                 previous_cpu = cpu_now;
                 let over_ns = elapsed_ns(window_started);
@@ -240,7 +242,7 @@ pub async fn run(opt: SlowOpt) -> Result<()> {
     print_slowest(&inbox, &mut resolver, &opt, wall_offset);
     let (slow, shown) = (inbox.borrow().slow, inbox.borrow().listed);
     let counters = Counters::read(skel)?;
-    let cpu = proc_cpu::read(skel)?;
+    let cpu = cpu_tracker.read(skel)?;
     let over_ns = elapsed_ns(started);
     if opt.json {
         let usage = usage.sample()?;
@@ -373,7 +375,7 @@ fn print_json_summaries(
         );
     }
     for (pid, cpu) in cpu {
-        if cpu.runq_own_ns + cpu.runq_others_ns > 0 {
+        if cpu.any() {
             println!("{}", json::process_cpu(window_s, *pid, over_ns, cpu));
         }
     }

@@ -536,10 +536,14 @@ pub enum Counter {
     /// region, or for the next region, and the runtime's own doings. It is
     /// charged to no request.
     OmpTeamIdleCpuNs = 34,
+    /// A traced process's figures on a CPU had no room in the table of
+    /// what each process ran and waited on each CPU: its threads' waits
+    /// there, and what they ran there, are not counted.
+    ProcCpuInsertFailed = 35,
 }
 
 /// Number of slots in the counter array.
-pub const COUNTER_MAX: u32 = 35;
+pub const COUNTER_MAX: u32 = 36;
 
 impl Counter {
     pub const ALL: [Self; COUNTER_MAX as usize] = [
@@ -578,6 +582,7 @@ impl Counter {
         Self::HelperLateNs,
         Self::OmpRegionUnfollowed,
         Self::OmpTeamIdleCpuNs,
+        Self::ProcCpuInsertFailed,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -617,6 +622,7 @@ impl Counter {
             Self::HelperLateNs => "helper_late_ns",
             Self::OmpRegionUnfollowed => "omp_region_unfollowed",
             Self::OmpTeamIdleCpuNs => "omp_team_idle_cpu_ns",
+            Self::ProcCpuInsertFailed => "proc_cpu_insert_failed",
         }
     }
 
@@ -656,6 +662,7 @@ impl Counter {
             | Self::ReqCarrierFailed
             | Self::ReqGroupInsertFailed
             | Self::OmpRegionUnfollowed
+            | Self::ProcCpuInsertFailed
             | Self::UnitReadInconsistent
             | Self::ReqH2Lost
             | Self::ReqStreamInsertFailed
