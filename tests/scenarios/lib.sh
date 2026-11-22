@@ -88,7 +88,8 @@ live_agents() {
 }
 
 # --- output parsing -----------------------------------------------------------
-# Parses `blame runq` output: "bucket lo_us=.. count=..", "key=value" fields.
+# Parses `blame top --histogram` output: the machine's "bucket lo_us=..
+# count=.." lines, and "key=value" fields.
 
 # Last integer/decimal value of `KEY=` in FILE; empty if absent.
 field() { grep -oP "(?<=\b$2=)[0-9.]+" "$1" | tail -1; }
@@ -113,11 +114,12 @@ samples_ge() {
         | awk -v m="$2" '$1 >= m { s += $2 } END { print s + 0 }'
 }
 
-# Run `blame runq` for SECS seconds in the foreground, logging to LOG.
+# Run `blame top --histogram` for SECS seconds in the foreground, logging to
+# LOG: the machine's waits for a CPU, bucket by bucket, whatever the service.
 run_runq() {
     local secs=$1 log=$2
     shift 2
-    sudo -n "$BIN" runq --duration "$secs" "$@" >"$log" 2>&1
+    sudo -n "$BIN" top --histogram --interval 0 --duration "$secs" "$@" >"$log" 2>&1
 }
 
 # Cumulative context switches since boot, all CPUs.

@@ -39,13 +39,24 @@ pub struct TopOpt {
     /// accounting.
     #[clap(long, value_name = "N")]
     group_entries: Option<u32>,
+
+    /// Also show how long all runnable threads on the machine waited for a
+    /// CPU, bucket by bucket, whatever their service.
+    #[clap(long)]
+    histogram: bool,
+
+    /// Length of the tables indexed by thread id; default the kernel's
+    /// `pid_max`. Threads with a larger id are counted as lost. For tests of
+    /// the loss accounting.
+    #[clap(long, value_name = "N", hide = true)]
+    runq_start_entries: Option<u32>,
 }
 
 /// Waits of at least 1024 us count as slow; a bucket starts there.
 const SLOW_FIRST_BUCKET: usize = runq_bucket(1_024_000) as usize;
 
 pub async fn run(opt: TopOpt) -> Result<()> {
-    let attached = runq::attach(None, opt.group_entries, true)?;
+    let attached = runq::attach(opt.runq_start_entries, opt.group_entries, true)?;
     let (skel, seeded) = (&attached.skel, attached.seeded);
     // Records are queued by the ring buffer callback and taken in here, where
     // the resolver is.
@@ -77,6 +88,7 @@ pub async fn run(opt: TopOpt) -> Result<()> {
     ticker.tick().await; // completes immediately
 
     let mut previous: HashMap<u64, Hist> = HashMap::new();
+    let mut previous_machine: Hist = [0; RUNQ_BUCKETS as usize];
     loop {
         tokio::select! {
             _ = sigint.recv() => break,
@@ -92,6 +104,11 @@ pub async fn run(opt: TopOpt) -> Result<()> {
                 previous = current;
                 println!("--- top (window {}s) ---", opt.interval);
                 print!("{}", render(&aggregate(&window, &mut resolver), opt.rows));
+                if opt.histogram {
+                    let machine = read_hist(skel)?;
+                    println!("  machine {}", summary(&delta(&machine, &previous_machine)).render());
+                    previous_machine = machine;
+                }
                 println!("  {}", kernel_line(&Counters::read(skel)?));
             }
         }
@@ -107,6 +124,10 @@ pub async fn run(opt: TopOpt) -> Result<()> {
         render(&aggregate(&reading.groups, &mut resolver), opt.rows)
     );
     println!("  {}", reading.conservation());
+    if opt.histogram {
+        println!("  machine, all threads:");
+        print!("{}", runq::render_histogram(&read_hist(skel)?));
+    }
     println!("  {}", kernel_line(&Counters::read(skel)?));
     print_bpf_cost(skel, elapsed)?;
     println!("  names   learned_from_events={}", resolver.learned);

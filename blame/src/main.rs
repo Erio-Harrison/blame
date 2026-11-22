@@ -4,8 +4,8 @@
 //! `slow` is the tool: each HTTP/1.1 request and HTTP/2 or gRPC call the
 //! traced processes serve, split into time on a CPU, waiting for one, and
 //! blocked on the disk, a downstream call, a file service and the like, by
-//! thread, goroutine or tokio task. `top` and `runq` show how long runnable
-//! threads wait for a CPU, per service or for the machine. Without a
+//! thread, goroutine or tokio task. `top` shows how long runnable threads wait
+//! for a CPU, per service and (`--histogram`) for the machine. Without a
 //! subcommand the agent streams process starts: a check that the path from
 //! the kernel to user space works and says what it drops.
 
@@ -61,8 +61,6 @@ struct Opt {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Measure how long runnable threads wait for a CPU.
-    Runq(runq::RunqOpt),
     /// Show run-queue latency per service, container or pod.
     Top(top::TopOpt),
     /// Show slow requests (HTTP/1.1, HTTP/2, gRPC) and where their time went.
@@ -79,7 +77,6 @@ async fn main() -> Result<()> {
     }
 
     match opt.command {
-        Some(Command::Runq(runq_opt)) => runq::run(runq_opt).await,
         Some(Command::Top(top_opt)) => top::run(top_opt).await,
         Some(Command::Slow(slow_opt)) => slow::run(slow_opt).await,
         None => run_exec_trace(opt).await,

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 #
-# Run-queue latency acceptance: measured correctly, cheaply, honestly.
+# Run-queue latency acceptance: measured correctly, cheaply, honestly. The
+# machine's waits are read from `blame top --histogram`.
 #
 # Needs root or passwordless sudo, bpftool, taskset, python3.
 #     ./tests/scenarios/m1_acceptance.sh [blame-binary]
@@ -21,7 +22,7 @@ trap 'reap_tracked; rm -rf "$WORK"' EXIT
 # --- thresholds ---------------------------------------------------------------
 #
 # PROVISIONAL: wide margins from a first run with a `runqlat` stand-in in a
-# noisy 6-vCPU VM. Tighten once `blame runq` has its own numbers.
+# noisy 6-vCPU VM. Tighten once there are numbers from bare metal.
 # Microseconds unless noted.
 
 # Idle machine.
@@ -174,13 +175,13 @@ fi
 echo
 echo "[6] no residue after SIGKILL"
 before=$(bpf_prog_ids)
-sudo -n "$BIN" runq >"$WORK/kill.log" 2>&1 &
+sudo -n "$BIN" top >"$WORK/kill.log" 2>&1 &
 AGENT_JOB=$!
 for _ in $(seq 100); do
-    grep -q 'runq attached' "$WORK/kill.log" 2>/dev/null && break
+    grep -q 'top attached' "$WORK/kill.log" 2>/dev/null && break
     sleep 0.1
 done
-grep -q 'runq attached' "$WORK/kill.log" 2>/dev/null \
+grep -q 'top attached' "$WORK/kill.log" 2>/dev/null \
     || bad "agent never reported being attached; log follows: $(cat "$WORK/kill.log")"
 
 during=$(bpf_prog_ids)

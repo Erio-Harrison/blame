@@ -1,42 +1,21 @@
-//! `blame runq`: how long runnable threads wait for a CPU.
+//! How long runnable threads wait for a CPU: the run-queue programs, their
+//! histograms and how they are summed up and shown, for `blame top` and
+//! `blame slow`.
 
-use std::{
-    os::fd::OwnedFd,
-    path::Path,
-    time::{Duration, Instant},
-};
+use std::{os::fd::OwnedFd, path::Path, time::Duration};
 
 use anyhow::{Context as _, Result};
 use blame_common::{Counter, RUNQ_BUCKETS, runq_bucket_range_us};
-use clap::Args;
 use libbpf_rs::{Link, MapCore, MapFlags, ProgramMut};
-use tokio::signal::unix::{SignalKind, signal};
 
 use crate::{
     bpf::{self, Skel},
     cgroupfs::CGROUP_ROOT,
     procfs,
-    stats::{Counters, UsageTracker, human_bytes},
+    stats::Counters,
 };
 
-#[derive(Debug, Args)]
-pub struct RunqOpt {
-    /// Stop after this many seconds. Default: run until interrupted.
-    #[clap(long, value_name = "SECS")]
-    duration: Option<u64>,
-
-    /// Seconds between per-window reports. 0 reports only on exit.
-    #[clap(long, default_value_t = 10, value_name = "SECS")]
-    interval: u64,
-
-    /// Length of the table indexed by thread id; default is the kernel's
-    /// `pid_max`. Threads with a larger id are counted as lost. Shrink it to
-    /// exercise the loss accounting.
-    #[clap(long, value_name = "N")]
-    runq_start_entries: Option<u32>,
-}
-
-/// The programs this command loads and attaches.
+/// The run-queue programs.
 const PROGRAMS: [&str; 3] = ["runq_wakeup", "runq_wakeup_new", "runq_switch"];
 
 fn programs(skel: &Skel) -> [(&'static str, &ProgramMut<'static>); 3] {
@@ -154,63 +133,19 @@ fn seed_threads(skel: &Skel) -> Result<usize> {
     Ok(seeded)
 }
 
-pub async fn run(opt: RunqOpt) -> Result<()> {
-    let attached = attach(opt.runq_start_entries, None, false)?;
-    let skel = &attached.skel;
-
-    let started = Instant::now();
-    let mut usage = UsageTracker::new()?;
-    println!("blame: runq attached");
-
-    let mut sigterm = signal(SignalKind::terminate()).context("installing SIGTERM handler")?;
-    // Created once: a fresh listener per loop pass misses a Ctrl-C that
-    // arrives while a branch body runs.
-    let mut sigint = signal(SignalKind::interrupt()).context("installing SIGINT handler")?;
-    let timer = tokio::time::sleep(
-        opt.duration
-            .map_or(Duration::from_secs(10 * 365 * 86_400), Duration::from_secs),
-    );
-    tokio::pin!(timer);
-    let mut ticker = tokio::time::interval(Duration::from_secs(opt.interval.max(1)));
-    ticker.tick().await; // completes immediately
-
-    let mut previous: Hist = [0; RUNQ_BUCKETS as usize];
-    loop {
-        tokio::select! {
-            _ = sigint.recv() => break,
-            _ = sigterm.recv() => break,
-            _ = &mut timer => break,
-            _ = ticker.tick(), if opt.interval > 0 => {
-                let current = read_hist(skel)?;
-                let window = delta(&current, &previous);
-                previous = current;
-                println!("--- runq (window {}s) ---", opt.interval);
-                println!("  {}", summary(&window).render());
-                println!("  {}", kernel_line(&Counters::read(skel)?));
-            }
-        }
-    }
-
-    let elapsed = started.elapsed();
-    let total = read_hist(skel)?;
-    println!("\n--- runq (final) ---");
-    for (k, &count) in total.iter().enumerate() {
+/// The distribution of waits, bucket by bucket (`bucket lo_us=.. hi_us=..
+/// count=..`, the last bucket's upper bound `inf`), then its summary.
+pub fn render_histogram(hist: &Hist) -> String {
+    let mut out = String::new();
+    for (k, &count) in hist.iter().enumerate() {
         if count > 0 {
             let (lo, hi) = runq_bucket_range_us(k as u32);
             let hi = hi.map_or_else(|| "inf".to_string(), |v| v.to_string());
-            println!("  bucket lo_us={lo} hi_us={hi} count={count}");
+            out += &format!("  bucket lo_us={lo} hi_us={hi} count={count}\n");
         }
     }
-    println!("  {}", summary(&total).render());
-    println!("  {}", kernel_line(&Counters::read(skel)?));
-    print_bpf_cost(skel, elapsed)?;
-    let usage = usage.sample()?;
-    println!(
-        "  self    cpu={:.2}%  rss={}",
-        usage.cpu_percent,
-        human_bytes(usage.rss_bytes)
-    );
-    Ok(())
+    out += &format!("  {}\n", summary(hist).render());
+    out
 }
 
 /// Thread ids are below `pid_max`, so the table needs that many entries.
@@ -325,7 +260,7 @@ pub fn fmt_opt(value: Option<u64>, fmt: impl Fn(u64) -> String) -> String {
 }
 
 impl Summary {
-    fn render(&self) -> String {
+    pub fn render(&self) -> String {
         let mut notes = String::new();
         if self.p999_us.is_none() && self.samples > 0 {
             notes += &format!(

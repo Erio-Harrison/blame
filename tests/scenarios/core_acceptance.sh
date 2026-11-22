@@ -88,13 +88,13 @@ PY
 layout() {
     cat <<EOF
 struct trace_event_raw_sched_process_exec { ${EXEC_FILENAME-unsigned int __data_loc_filename;} int old_pid; };
-struct trace_event_raw_cgroup { int root; unsigned long long id; unsigned int __data_loc_path; };
+struct trace_event_raw_cgroup { unsigned long long ent; int root; int level; unsigned long long id; unsigned int __data_loc_path; };
 struct trace_event_raw_sched_process_exec a; struct trace_event_raw_cgroup d;
 $(task_layout)
 EOF
 }
 
-# Offset of every memory load in the loaded runq_switch, while `runq` runs.
+# Offset of every memory load in the loaded runq_switch, while `top` runs.
 switch_loads() {
     local id
     id=$(sudo -n bpftool prog show -j \
@@ -103,10 +103,11 @@ switch_loads() {
     sudo -n bpftool prog dump xlated id "$id" | grep -oP '\(r[0-9] \+\K[0-9]+(?=\))' | sort -un | tr '\n' ' '
 }
 
-# Start `runq` with the given args for a few seconds and capture its loads.
+# Start `top` (which loads the run-queue programs) with the given args for a
+# few seconds and capture its loads.
 loads_under() {
     local log="$1"; shift
-    sudo -n "$BIN" runq --duration 3 --interval 0 "$@" >"$log" 2>&1 &
+    sudo -n "$BIN" top --histogram --duration 3 --interval 0 "$@" >"$log" 2>&1 &
     local pid=$!
     sleep 1.5
     switch_loads
@@ -159,10 +160,10 @@ note "fake layout pid@$TGID_OFF; runq_switch loads at: $loads"
 echo
 echo "[2] incompatible layouts are refused"
 btf=$(ON_CPU="" layout | fake_btf missing) || exit 1
-expect_refused "missing task_struct.on_cpu" "$WORK/missing.log" runq --duration 1 --btf "$btf"
+expect_refused "missing task_struct.on_cpu" "$WORK/missing.log" top --duration 1 --btf "$btf"
 
 btf=$(PID="char pid[4];" layout | fake_btf retyped) || exit 1
-expect_refused "task_struct.pid is no longer an integer" "$WORK/retyped.log" runq --duration 1 --btf "$btf"
+expect_refused "task_struct.pid is no longer an integer" "$WORK/retyped.log" top --duration 1 --btf "$btf"
 
 # `__rel_loc` measures the payload from the field, not the record.
 btf=$(EXEC_FILENAME="unsigned int __rel_loc_filename;" layout | fake_btf relloc) || exit 1

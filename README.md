@@ -34,8 +34,9 @@ Use `cargo build`, `cargo check`, etc. as normal. Loading eBPF programs needs ro
 ```shell
 cargo build --release
 sudo ./target/release/blame                    # trace exec events
-sudo ./target/release/blame runq --duration 10 # run-queue latency
-sudo ./target/release/blame top --duration 10  # run-queue latency per service / container / pod
+sudo ./target/release/blame top --duration 10  # how long runnable threads wait for a CPU, per service /
+                                               # container / pod, any process (not only HTTP or gRPC)
+sudo ./target/release/blame top --histogram    # also the whole machine's waits, bucket by bucket
 sudo ./target/release/blame slow --above 100   # HTTP/1.1 requests and gRPC calls slower than 100 ms,
                                                # and where the time went
 sudo ./target/release/blame slow --json --duration 30   # the same as JSON, one record a line:
