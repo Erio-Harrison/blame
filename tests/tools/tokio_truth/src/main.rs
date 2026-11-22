@@ -112,17 +112,28 @@ fn now() -> u64 {
     ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
 }
 
-/// Compute for `us` microseconds without a system call; the time it took.
+/// CPU time this thread has used, in ns.
+fn thread_cpu_ns() -> u64 {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: `ts` is a valid timespec to write.
+    unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+}
+
+/// Compute for `us` microseconds of this thread's CPU, without a system call
+/// in between; the CPU it took. Timed by the thread's CPU clock, not the wall
+/// clock: time the thread was preempted is not computing, and counting it
+/// would make a run-queue wait read as CPU.
 fn spin(us: i64) -> u64 {
     if us <= 0 {
         return 0;
     }
-    let start = Instant::now();
-    let want = Duration::from_micros(us as u64);
-    while start.elapsed() < want {
+    let want = us as u64 * 1000;
+    let start = thread_cpu_ns();
+    while thread_cpu_ns() - start < want {
         std::hint::spin_loop();
     }
-    start.elapsed().as_nanos() as u64
+    thread_cpu_ns() - start
 }
 
 /// Files to append to and flush, one per spawned task at a time.

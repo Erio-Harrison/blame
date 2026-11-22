@@ -83,7 +83,12 @@ AGENT_JOB=""
 ORACLE_JOB=""
 CG="/sys/fs/cgroup/blame-cpu-wait-$$"
 CONTAINER=""
+MEANWHILE=
 cleanup() {
+    # A loop of [18] to [20] is a background job, which an interrupt does not
+    # reach: stopped here, and a server it stopped let go on.
+    enough
+    [[ -n "${SERVER_PID:-}" ]] && kill -CONT "$SERVER_PID" 2>/dev/null
     stop_agent
     [[ -n "$ORACLE_JOB" ]] && { sudo -n pkill -INT -P "$ORACLE_JOB" 2>/dev/null; wait "$ORACLE_JOB" 2>/dev/null; }
     [[ -n "$CONTAINER" ]] && sudo -n docker rm -f "$CONTAINER" >/dev/null 2>&1
@@ -96,8 +101,10 @@ trap cleanup EXIT
 cc -O2 -pthread -o "$WORK/http_truth" "$SCN_DIR/../tools/http_truth.c" || exit 1
 cc -O2 -Wall -pthread -o "$WORK/http_load" "$SCN_DIR/../tools/http_load.c" || exit 1
 
-le() { awk -v a="$1" -v b="$2" 'BEGIN { exit !(a + 0 <= b + 0) }'; }
-ge() { awk -v a="$1" -v b="$2" 'BEGIN { exit !(a + 0 >= b + 0) }'; }
+# Comparisons fail on a value that is not a number (an empty one).
+isnum() { [[ $1 =~ ^[-+]?[0-9]+(\.[0-9]+)?$ ]]; }
+le() { isnum "$1" && isnum "$2" && awk -v a="$1" -v b="$2" 'BEGIN { exit !(a + 0 <= b + 0) }'; }
+ge() { isnum "$1" && isnum "$2" && awk -v a="$1" -v b="$2" 'BEGIN { exit !(a + 0 >= b + 0) }'; }
 ms() { echo $(( ${1:-0} / 1000000 )); }
 pct() { (( ${2:-0} > 0 )) && echo $(( $1 * 100 / $2 )) || echo 0; }
 want() { [[ -z "${ONLY:-}" || " $ONLY " == *" $1 "* ]]; }
@@ -130,9 +137,14 @@ C2="$((NCPU - 2))-$((NCPU - 1))"
 CLOAD="0-$((NCPU - 3))"
 QUOTA="25000 100000"   # a quarter of a CPU
 
-# Whether this kernel counts a group's throttled time (kernel.h, 6.6 on).
+# Whether this kernel counts a group's throttled time (kernel.h, 6.6 on). The
+# kernel's types must be readable to say: if not, the limit cases are not
+# skipped as if the kernel were older, the run fails.
 LIMIT_KEPT=
-(( $(sudo -n bpftool btf dump file /sys/kernel/btf/vmlinux 2>/dev/null | grep -c "throttled_clock_self_time") > 0 )) && LIMIT_KEPT=1
+KERNEL_TYPES=$(sudo -n bpftool btf dump file /sys/kernel/btf/vmlinux 2>/dev/null) && [[ -n "$KERNEL_TYPES" ]] \
+    || { echo "could not read the kernel's types (bpftool btf dump): which cases apply is not known" >&2; exit 1; }
+grep -q "throttled_clock_self_time" <<<"$KERNEL_TYPES" && LIMIT_KEPT=1
+unset KERNEL_TYPES
 
 waited() { cat /proc/"$1"/task/*/schedstat 2>/dev/null | awk '{ s += $2 } END { printf "%d\n", s }'; }
 throttled() { [[ -n "$1" ]] && awk '$1 == "throttled_usec" { printf "%d\n", $2 * 1000 }' "$1/cpu.stat" 2>/dev/null || echo 0; }
@@ -278,7 +290,7 @@ done_with
 }
 
 if [[ -z "$LIMIT_KEPT" ]]; then
-    note "this kernel does not count a group's throttled time: the limit cases [4] to [8], [10] are skipped"
+    note "this kernel does not count a group's throttled time: the limit cases [4] to [8], [10], [15], [19] and the limit runs of [13] and [14] are skipped"
 else
 want 4 && {
 echo "[4] one thread under a limit of a quarter of a CPU"
@@ -451,7 +463,10 @@ done_with
 
 # meanwhile CMD...: run it again and again while the load runs; stop with `enough`.
 meanwhile() { ( while :; do "$@"; done ) >/dev/null 2>&1 & MEANWHILE=$!; }
-enough() { kill "$MEANWHILE" 2>/dev/null; wait "$MEANWHILE" 2>/dev/null; }
+enough() {
+    [[ -n "$MEANWHILE" ]] || return 0
+    kill "$MEANWHILE" 2>/dev/null; wait "$MEANWHILE" 2>/dev/null; MEANWHILE=
+}
 
 want 18 && {
 echo "[18] the server's CPUs changed while its threads wait"
@@ -505,17 +520,20 @@ echo "[17] random cases"
 SEED="${CPU_WAIT_SEED:-$RANDOM}"
 note "seed $SEED (CPU_WAIT_SEED=$SEED repeats these)"
 RANDOM=$SEED
-pick() { local a=("$@"); echo "${a[RANDOM % ${#a[@]}]}"; }
+# pick VAR CHOICES...: in this shell, not in $( ): a subshell's draws would
+# not move this shell's RANDOM on, and bash reseeds it in each subshell, so
+# the seed would repeat nothing.
+pick() { local -n pick_into=$1; shift; local choices=("$@"); pick_into=${choices[RANDOM % ${#choices[@]}]}; }
 for ((i = 1; i <= ${CPU_WAIT_RANDOM:-6}; i++)); do
-    kind=$(pick pool pool epoll)
-    cpus=$(pick "$C1" "$C1" "$C2")
-    workers=$(pick 1 2 4 6)
-    limit=$(pick "" "" "max" "25000 100000" "50000 100000" "100000 100000" "150000 100000")
-    nested=$(pick "" "" nested)
-    hogs=$(pick 0 0 1 2)
-    conns=$(pick 2 4 8 16)
-    think=$(pick 0 0 200 1000 3000)
-    spin=$(pick 100 300 1000)
+    pick kind pool pool epoll
+    pick cpus "$C1" "$C1" "$C2"
+    pick workers 1 2 4 6
+    pick limit "" "" "max" "25000 100000" "50000 100000" "100000 100000" "150000 100000"
+    pick nested "" "" nested
+    pick hogs 0 0 1 2
+    pick conns 2 4 8 16
+    pick think 0 0 200 1000 3000
+    pick spin 100 300 1000
     [[ -z "$LIMIT_KEPT" ]] && limit=""
     [[ -z "$limit" ]] && nested=""
     name="random$i"

@@ -31,6 +31,12 @@ struct_offset() {
 task_offset() { struct_offset "$1"; }
 PID_OFF=$(task_offset pid)
 TGID_OFF=$(task_offset tgid)
+# Every check below compares against these: without them each would pass
+# on an empty pattern.
+[[ $PID_OFF =~ ^[0-9]+$ && $TGID_OFF =~ ^[0-9]+$ ]] || {
+    echo "could not read task_struct's pid and tgid offsets from the kernel's BTF (pid=$PID_OFF tgid=$TGID_OFF)" >&2
+    exit 1
+}
 
 # Compile a C layout into a raw BTF file: fake_btf NAME < source
 fake_btf() {

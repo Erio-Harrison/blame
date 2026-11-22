@@ -97,8 +97,11 @@ field() { grep -oP "(?<=\b$2=)[0-9.]+" "$1" | tail -1; }
 # whatever the sample count: the report itself leaves out tail percentiles
 # that too few samples back.
 bucket_pct() {
+    # The last bucket has no upper bound (`hi_us=inf`): a number above every
+    # other, so that the result stays a number bash can compare.
     grep -E '^\s*bucket ' "$1" \
         | sed -E 's/.*hi_us=([0-9a-z]+).*count=([0-9]+).*/\1 \2/' \
+        | sed -E 's/^inf /1000000000 /' \
         | awk -v p="$2" '{ hi[NR] = $1; c[NR] = $2; n += $2 }
               END { r = n * p / 100; for (i = 1; i <= NR; i++) { s += c[i]; if (s >= r) { print hi[i]; exit } } }'
 }

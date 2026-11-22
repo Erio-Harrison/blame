@@ -17,7 +17,7 @@
 use std::{
     io::Write as _,
     sync::Mutex,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use tonic::{transport::Server, Code, Request, Response, Status};
@@ -46,15 +46,26 @@ fn now() -> u64 {
     ts.sec as u64 * 1_000_000_000 + ts.nsec as u64
 }
 
+/// CPU time this thread has used, in ns (CLOCK_THREAD_CPUTIME_ID).
+fn thread_cpu_ns() -> u64 {
+    let mut ts = Timespec { sec: 0, nsec: 0 };
+    unsafe { clock_gettime(3, &mut ts) };
+    ts.sec as u64 * 1_000_000_000 + ts.nsec as u64
+}
+
+/// Compute for `us` microseconds of this thread's CPU; the CPU it took.
+/// Timed by the thread's CPU clock: time it was preempted is not computing,
+/// and counting it would make a run-queue wait read as CPU.
 fn spin(us: u64) -> u64 {
     if us == 0 {
         return 0;
     }
-    let start = Instant::now();
-    while start.elapsed() < Duration::from_micros(us) {
+    let want = us * 1000;
+    let start = thread_cpu_ns();
+    while thread_cpu_ns() - start < want {
         std::hint::spin_loop();
     }
-    start.elapsed().as_nanos() as u64
+    thread_cpu_ns() - start
 }
 
 struct Hello;

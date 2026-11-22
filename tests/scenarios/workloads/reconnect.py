@@ -17,7 +17,9 @@ end = time.time() + secs
 def work():
     while time.time() < end:
         try:
-            s = socket.create_connection(("127.0.0.1", port))
+            # A server that stops answering ends this worker's request, not
+            # the whole test.
+            s = socket.create_connection(("127.0.0.1", port), timeout=10)
             s.sendall(f"GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n".encode())
             while s.recv(65536):
                 pass

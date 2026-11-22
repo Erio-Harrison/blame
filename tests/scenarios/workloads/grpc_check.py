@@ -117,7 +117,7 @@ def main():
     by_trace, by_stream = {}, {}
     listed = {}  # path -> [requests, cpu ns, longest ns]
     methods = {}
-    total = named = unnamed_followed = resets = timed = with_trace = 0
+    total = named = unnamed_followed = resets = timed = with_trace = dup_trace = 0
     for line in open(slow_path, errors="replace"):
         if line.startswith("method "):
             m = dict(p.split("=", 1) for p in line.split()[1:])
@@ -145,6 +145,8 @@ def main():
             named += 1
         if k["trace"] != "-":
             with_trace += 1
+            # A call reported twice: only one of the reports is joined.
+            dup_trace += k["trace"] in by_trace
             by_trace[k["trace"]] = k
         by_stream[(k["rport"], k["stream"])] = k
 
@@ -241,7 +243,7 @@ def main():
     print(
         f"grpc served={len(served)} reported={total} named={named} with_trace={with_trace} joined={joined} by_trace={traced}"
         f" paths={paths} path_ok={path_ok} answered={answered} statuses={statuses} status_ok={status_ok}"
-        f" trace_wrong={trace_wrong}"
+        f" trace_wrong={trace_wrong} dup_trace={dup_trace}"
         f" followed={followed} unit_ok={unit_ok}"
         f" inside={inside} cpu_ok_pct={100 * cpu_ok / followed if followed else 0:.2f}"
         f" cpu_err_pct={100 * (cpu_seen - cpu_truth) / cpu_truth if cpu_truth else 0:+.2f}"

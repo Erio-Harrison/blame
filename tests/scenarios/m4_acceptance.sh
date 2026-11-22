@@ -24,18 +24,30 @@
 #                    server and client that speak the frames by hand
 # [10] gRPC          calls by method, status and trace id, and the time of the
 #                    handler that served each, against grpc-go and tonic servers
+# [11] spawned       goroutines and tasks a request spawns are followed as its
+#                    helpers (--deep)
+# [12] file services waits for NFS, FUSE or virtiofs are not taken for disk
+#                    waits (needs a directory on one: BLAME_FSVC_DIR, or this
+#                    checkout on one)
+# [13] park reasons  why a request's goroutine or task was on no thread
+#                    (--deep)
 # [14] OpenMP        the threads of a team that take up a request's parallel
 #                    work (GNU libgomp): their CPU and their wait for a CPU,
 #                    against a server that opens regions (needs -fopenmp)
 #
-# Needs root or passwordless sudo, a C compiler, python3. nginx is used if
+# What all of a process's threads waited for a CPU is tested apart, in
+# tests/scenarios/cpu_wait.sh.
+#
+# Needs root or passwordless sudo, a C compiler, python3, curl. nginx is used if
 # installed; the Go server needs a Go toolchain (skipped without one), the
 # tokio server is built with cargo. The gRPC servers also need their
 # libraries (grpc-go, tonic), fetched on the first build; skipped without.
 #     ./tests/scenarios/m4_acceptance.sh [blame-binary]
 # Env: BLAME_BIN, SCN_DURATION (seconds of load per case, default 4),
 #      ONLY (space separated section numbers; default all),
-#      GO (the go command; default: the one on PATH)
+#      GO (the go command; default: the one on PATH),
+#      BLAME_FSVC_DIR (a directory on a file service, for [12]),
+#      KEEP_WORK=1 (keep the logs, to look into a failure)
 
 set -uo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
@@ -56,6 +68,8 @@ cleanup() {
     stop_agent
     reap_tracked
     [[ -n "$MEM_CG" ]] && sudo -n rmdir "$MEM_CG" 2>/dev/null
+    # [12] makes its files on the file service, which may be this checkout.
+    [[ -n "${FSVC_TMP:-}" ]] && rm -rf "$FSVC_TMP"
     # KEEP_WORK=1 keeps the logs, to look into a failure.
     if [[ -n "${KEEP_WORK:-}" ]]; then echo "work directory kept: $WORK"; else rm -rf "$WORK"; fi
 }
@@ -87,9 +101,15 @@ IDLE_PCT_MAX=1
 
 # --- helpers ------------------------------------------------------------------
 
-le() { awk -v a="$1" -v b="$2" 'BEGIN { exit !(a + 0 <= b + 0) }'; }
-ge() { awk -v a="$1" -v b="$2" 'BEGIN { exit !(a + 0 >= b + 0) }'; }
-abs() { awk -v a="$1" 'BEGIN { print (a < 0 ? -a : a) }'; }
+# Comparisons fail on a value that is not a number: an empty one (a checker
+# that did not say it), or nan (one with no samples to say it of).
+isnum() { [[ $1 =~ ^[-+]?[0-9]+(\.[0-9]+)?$ ]]; }
+le() { isnum "$1" && isnum "$2" && awk -v a="$1" -v b="$2" 'BEGIN { exit !(a + 0 <= b + 0) }'; }
+ge() { isnum "$1" && isnum "$2" && awk -v a="$1" -v b="$2" 'BEGIN { exit !(a + 0 >= b + 0) }'; }
+abs() { isnum "$1" && awk -v a="$1" 'BEGIN { print (a < 0 ? -a : a) }'; }
+# a - b, or "?" if either is not a number: for messages, where $(( )) on an
+# empty value would end the whole section without a word.
+minus() { isnum "$1" && isnum "$2" && awk -v a="$1" -v b="$2" 'BEGIN { print a - b }' || echo "?"; }
 boot_ns() { python3 -c 'import time; print(time.clock_gettime_ns(time.CLOCK_BOOTTIME))'; }
 
 # Start a ground-truth server; its pid lands in SERVER_PID.
@@ -134,7 +154,25 @@ client() { python3 "$WORKLOADS/http_client.py" "$PORT" "$@" >/dev/null 2>&1; }
 load() { "$WORK/http_load" "$PORT" "$@" >/dev/null 2>&1; }
 
 # Run the comparison; the result line lands in CHECK.
-check() { CHECK=$(python3 "$WORKLOADS/http_check.py" "$@"); note "$CHECK"; }
+# A checker that fails or says nothing is a failure of the case, said once.
+check() {
+    if ! CHECK=$(python3 "$WORKLOADS/http_check.py" "$@" 2>"$WORK/check.err") || [[ -z "$CHECK" ]]; then
+        bad "the checker failed on $1: $(tail -1 "$WORK/check.err")"
+        CHECK=""
+        return 1
+    fi
+    note "$CHECK"
+}
+# The same for the other checkers: VAR SCRIPT ARGS... sets VAR.
+run_checker() {
+    local var=$1 out
+    shift
+    if ! out=$(python3 "$@" 2>"$WORK/check.err") || [[ -z "$out" ]]; then
+        bad "the checker $(basename "$1") failed on $2: $(tail -1 "$WORK/check.err")"
+        out=""
+    fi
+    printf -v "$var" '%s' "$out"
+}
 val() { echo "$CHECK" | grep -oP "(?<=\b$1=)-?[0-9.]+"; }
 
 # Idle time the server reported, in microseconds (label 1 = idle).
@@ -156,6 +194,10 @@ EOF
 # only (those under way at a cut-off).
 expect_boundaries() {
     local what=$1 slack=${2:-0} diff
+    if ! isnum "$(val truth)" || ! isnum "$(val kernel)"; then
+        bad "$what: no counts to compare (truth=$(val truth) kernel=$(val kernel))"
+        return 1
+    fi
     diff=$(( $(val truth) - $(val kernel) ))
     (( ${diff#-} <= slack && $(val truth) > 0 )) \
         && ok "$what: every request seen once ($(val kernel))" \
@@ -629,9 +671,9 @@ start_agent "$WORK/dn.log" --pid "$SERVER_PID" && {
         && ok "three pipelined downstream calls are timed as one, to the last answer ($(dval pipe_ok) of $(dval pipe))" \
         || bad "pipelined downstream calls: $(dval pipe_ok) of $(dval pipe) right"
     mixed=$(kernel_counter "$WORK/dn.log" req_down_mixed)
-    (( $(dval shared) == 400 && $(dval shared_ok) == 400 && mixed > 0 )) \
+    (( $(dval shared) == 400 && $(dval shared_ok) == 400 && $(dval shared_timed) == 0 && mixed > 0 )) \
         && ok "calls of several requests overlapping on one connection are counted, not timed (req_down_mixed=$mixed, $(dval shared_timed) of $(dval shared) timed)" \
-        || bad "shared downstream connection: req_down_mixed=$mixed, $(dval shared_ok) of $(dval shared) requests with a possible wait"
+        || bad "shared downstream connection: req_down_mixed=$mixed, $(dval shared_ok) of $(dval shared) requests with a possible wait, $(dval shared_timed) timed"
     expect_no_loss downstream "$WORK/dn.log" req_parse_desync req_aborted req_response_unmatched
 }
 }
@@ -673,6 +715,9 @@ start_agent "$WORK/late_down.log" --pid "$SERVER_PID" && {
     stop_servers
     check "$WORK/late_down.bin" "$WORK/late_down.log" --after-ns $((attached + 200000000))
     # The server logs each of its threads' sleeps, the downstream wait among them.
+    ge "$(val paired_pct)" "$PAIRED_PCT_MIN" \
+        && ok "after attaching mid-call, every request after the cut-off is seen ($(val paired_pct)% of $(val truth))" \
+        || bad "after attaching mid-call: $(val paired_pct)% of $(val truth) requests seen"
     ge "$(val blk_ok_pct)" "$ATTR_OK_PCT_MIN" && (( $(val blk_n) > 100 )) \
         && ok "after attaching mid-call, downstream waits still count as the request's ($(val blk_ok_pct)% of $(val blk_n) right)" \
         || bad "after attaching mid-call: time asleep ok $(val blk_ok_pct)% of $(val blk_n), total $(val blk_err_pct)%"
@@ -813,22 +858,32 @@ rt_suite() {
     # on the dev VM drifts from some 15 us a request to 100 us at times.
     local kids="/k?size=200&cpu=2000&kids=3&kcpu=1500&cpu2=1000"
     rt_run "$rt-kids" "$server" 32 0 "$kids" && {
-        ge "$(val cpu_ok_pct)" "$ATTR_OK_PCT_MIN" \
-            && ok "$rt: a handler waiting for what it spawned has its own CPU by unit ($(val cpu_ok_pct)% right)" \
+        ge "$(val cpu_ok_pct)" "$ATTR_OK_PCT_MIN" && (( $(val cpu_n) > 100 )) \
+            && ok "$rt: a handler waiting for what it spawned has its own CPU by unit ($(val cpu_ok_pct)% of $(val cpu_n) right)" \
             || bad "$rt: by unit, a handler waiting for what it spawned: CPU ok $(val cpu_ok_pct)%, total $(val cpu_err_pct)%"
     }
     rt_run "$rt-kids-by-thread" "$server" 32 0 "$kids" --threads-only && {
-        le "$(val cpu_ok_pct)" 60 \
+        le "$(val cpu_ok_pct)" 60 && (( $(val cpu_n) > 100 )) \
             && ok "$rt: by thread, the same load is wrong: the spawned units' CPU is the handler's ($(val cpu_ok_pct)% right, total $(val cpu_err_pct)%)" \
             || bad "$rt: by thread the handler's CPU is still right ($(val cpu_ok_pct)%): the load does not tell the two apart"
     }
     rt_run "$rt-timer" "$server" 32 0 "$RT_TIMER_PATHS" && {
-        unseen=$(kernel_counter "$WORK/r_$rt-timer.log" unit_cpu_unseen_ns); unseen=${unseen:-0}
-        note "unit_cpu_unseen_ns=$unseen"
+        # CPU the agent could not place is counted where it reads which unit
+        # a thread runs (Go); with a probe at every switch (tokio) there is
+        # none to count, and the counter is not printed.
+        unseen=$(kernel_counter "$WORK/r_$rt-timer.log" unit_cpu_unseen_ns)
+        note "unit_cpu_unseen_ns=${unseen:-not counted}"
+        unseen_ok=0
+        if [[ -n "$unseen" ]]; then
+            (( unseen < 10000000 )) && unseen_ok=1
+        elif [[ $rt != go ]]; then
+            unseen_ok=1
+        fi
         # Probes say where the runtime switches goroutines or tasks: the CPU
         # around the timer wait is placed, and placed right.
-        ge "$(val cpu_ok_pct)" "$ATTR_OK_PCT_MIN" && le "$(abs "$(val cpu_err_pct)")" 5 && (( unseen < 10000000 )) \
-            && ok "$rt: CPU around a timer wait goes to the right request ($(val cpu_ok_pct)%, total $(val cpu_err_pct)%, ${unseen}ns not placed)" \
+        ge "$(val cpu_ok_pct)" "$ATTR_OK_PCT_MIN" && le "$(abs "$(val cpu_err_pct)")" 5 \
+            && (( $(val cpu_n) > 100 && unseen_ok )) \
+            && ok "$rt: CPU around a timer wait goes to the right request ($(val cpu_ok_pct)% of $(val cpu_n), total $(val cpu_err_pct)%, $([[ -n "$unseen" ]] && echo "${unseen}ns not placed" || echo "unplaced CPU not counted for $rt"))" \
             || bad "$rt: timer case: ok $(val cpu_ok_pct)%, total $(val cpu_err_pct)%, unit_cpu_unseen_ns=$unseen"
     }
 }
@@ -865,10 +920,11 @@ RT_LATE="$TT_TARGET/release/tokio_truth"
         stop_servers
         check "$WORK/r_late.bin" "$WORK/r_late.log" --after-ns "$late_from"
         grep -q "^blame: pid $SERVER_PID: .*task-level\$" "$WORK/r_late.log" \
+            && ge "$(val paired_pct)" "$PAIRED_PCT_MIN" \
             && ge "$(val down_ok_pct)" "$ATTR_OK_PCT_MIN" && ge "$(val cpu_ok_pct)" "$ATTR_OK_PCT_MIN" \
             && (( $(val down_n) > 100 )) \
-            && ok "a server started after the agent is recognised and attributed by task (CPU $(val cpu_ok_pct)%, downstream $(val down_ok_pct)%)" \
-            || bad "late server: $(grep "^blame: pid $SERVER_PID" "$WORK/r_late.log") CPU $(val cpu_ok_pct)% downstream $(val down_ok_pct)% of $(val down_n)"
+            && ok "a server started after the agent is recognised and attributed by task (seen $(val paired_pct)%, CPU $(val cpu_ok_pct)%, downstream $(val down_ok_pct)%)" \
+            || bad "late server: $(grep "^blame: pid $SERVER_PID" "$WORK/r_late.log") seen $(val paired_pct)%, CPU $(val cpu_ok_pct)% downstream $(val down_ok_pct)% of $(val down_n)"
     }
 }
 }
@@ -890,7 +946,7 @@ h2_case() {
     said=$(python3 "$WORKLOADS/h2_quirks.py" "${3:-client}" "$PORT")
     stop_agent
     stop_servers
-    H2=$(python3 "$WORKLOADS/h2_check.py" "$WORK/h2_$name.srv" "$WORK/h2_$name.log" --tol-us "${4:-300}")
+    run_checker H2 "$WORKLOADS/h2_check.py" "$WORK/h2_$name.srv" "$WORK/h2_$name.log" --tol-us "${4:-300}"
     note "$said"
     note "$H2"
     (( $(h2val streams) >= 290 && $(h2val missing) == 0 && $(h2val extra) == 0 )) \
@@ -939,7 +995,7 @@ start_agent "$WORK/h2_late.log" --pid "$SERVER_PID" && {
     wait "$steady"
     stop_agent
     stop_servers
-    H2=$(python3 "$WORKLOADS/h2_check.py" "$WORK/h2_late.srv" "$WORK/h2_late.log" --after-ns "$late_from")
+    run_checker H2 "$WORKLOADS/h2_check.py" "$WORK/h2_late.srv" "$WORK/h2_late.log" --after-ns "$late_from"
     note "$H2"
     (( $(h2val answered) > 500 && $(h2val missing) == 0 && $(h2val extra) == 0 \
         && $(h2val mistimed) * 50 <= $(h2val answered) )) \
@@ -986,7 +1042,7 @@ grpc_run() {
     "$WORK/grpc_client" "$PORT" 4 8 "$DUR" "${args[@]}" >"$WORK/g_$name.cli"
     stop_agent
     stop_servers
-    GRPC=$(python3 "$WORKLOADS/grpc_check.py" "$WORK/g_$name.srv" "$WORK/g_$name.log" "$WORK/g_$name.cli")
+    run_checker GRPC "$WORKLOADS/grpc_check.py" "$WORK/g_$name.srv" "$WORK/g_$name.log" "$WORK/g_$name.cli"
     note "$(grep -m1 "^blame: pid $SERVER_PID" "$WORK/g_$name.log")"
     note "$GRPC"
 }
@@ -1008,9 +1064,10 @@ grpc_case() {
     grep -q "^blame: pid $SERVER_PID: .*handlers followed" "$WORK/g_$name.log" \
         && ok "$name: the server is recognised and its handlers are followed" \
         || bad "$name: $(grep -m1 "^blame: pid $SERVER_PID" "$WORK/g_$name.log")"
-    (( $(gval served) > 1000 && $(gval by_trace) == $(gval served) && $(gval named) == $(gval reported) )) \
-        && ok "$name: every call the server handled is reported, with its trace id ($(gval served))" \
-        || bad "$name: served=$(gval served) by_trace=$(gval by_trace) reported=$(gval reported) named=$(gval named)"
+    (( $(gval served) > 1000 && $(gval by_trace) == $(gval served) && $(gval named) == $(gval reported) \
+       && $(gval dup_trace) == 0 && $(gval trace_wrong) == 0 )) \
+        && ok "$name: every call the server handled is reported once, with its trace id ($(gval served))" \
+        || bad "$name: served=$(gval served) by_trace=$(gval by_trace) reported=$(gval reported) named=$(gval named) reported twice=$(gval dup_trace) trace ids of no call=$(gval trace_wrong)"
     (( $(gval path_ok) == $(gval joined) && $(gval statuses) > 1000 && $(gval status_ok) == $(gval statuses) )) \
         && ok "$name: with the method the server ran and the status it answered" \
         || bad "$name: path_ok=$(gval path_ok) of $(gval joined), status_ok=$(gval status_ok) of $(gval statuses)"
@@ -1069,7 +1126,9 @@ grpc_late() {
     wait "$load"
     stop_agent
     stop_servers
-    GRPC=$(GRPC_ATTACHED_NS=$attached python3 "$WORKLOADS/grpc_check.py" "$WORK/g_$name.srv" "$WORK/g_$name.log" "$WORK/g_$name.cli")
+    export GRPC_ATTACHED_NS=$attached
+    run_checker GRPC "$WORKLOADS/grpc_check.py" "$WORK/g_$name.srv" "$WORK/g_$name.log" "$WORK/g_$name.cli"
+    unset GRPC_ATTACHED_NS
     note "$GRPC"
 }
 
@@ -1101,7 +1160,7 @@ if [[ -n "${GO_CMD:=${GO:-$(command -v go || true)}}" ]] \
         stop_agent
         stop_servers
         if [[ -n "$mode" ]]; then
-            GRPC=$(python3 "$WORKLOADS/grpc_check.py" "$q.srv" "$q.log" "$q.cli")
+            run_checker GRPC "$WORKLOADS/grpc_check.py" "$q.srv" "$q.log" "$q.cli"
             note "$GRPC"
             (( $(gval reported) == 0 && $(gval m_paths) == 4 && $(gval m_calls_ok) == 4 && $(gval m_ends_ok) == 4 )) \
                 && ok "nothing slow enough to list: the summary by method is complete all the same" \
@@ -1127,7 +1186,7 @@ if [[ -n "${GO_CMD:=${GO:-$(command -v go || true)}}" ]] \
     stop_agent
     stop_servers
     "$BIN" slow --json-fields >"$WORK/g_json.fields"
-    GRPC=$(python3 "$WORKLOADS/grpc_json_check.py" "$WORK/g_json.srv" "$WORK/g_json.log" "$WORK/g_json.cli" "$WORK/g_json.fields")
+    run_checker GRPC "$WORKLOADS/grpc_json_check.py" "$WORK/g_json.srv" "$WORK/g_json.log" "$WORK/g_json.cli" "$WORK/g_json.fields"
     note "$GRPC"
     (( $(gval lines) > 20 && $(gval bad) == 0 && $(gval framed) == 1 )) && [[ ! -s "$WORK/g_json.err" ]] \
         && ok "json: every line of output is a record of a known type, from start to the final health ($(gval lines))" \
@@ -1154,7 +1213,7 @@ if [[ -n "${GO_CMD:=${GO:-$(command -v go || true)}}" ]] \
         # headers were read before. 32 streams are in flight at a time; three
         # times that is allowed, whatever the number of calls.
         (( $(gval reported) > 1000 && $(gval reported) - $(gval joined) <= 96 )) \
-            && ok "go-late: calls on connections older than the agent are reported ($(gval reported), $(( $(gval reported) - $(gval joined) )) from before the probes)" \
+            && ok "go-late: calls on connections older than the agent are reported ($(gval reported), $(minus "$(gval reported)" "$(gval joined)") from before the probes)" \
             || bad "go-late: reported=$(gval reported) joined=$(gval joined)"
         (( $(gval paths) * 100 >= $(gval joined) * 99 && $(gval path_ok) == $(gval paths) )) \
             && ok "go-late: nearly all get their method ($(gval paths) of $(gval joined)), none a wrong one" \
@@ -1170,7 +1229,7 @@ if [[ -n "${GO_CMD:=${GO:-$(command -v go || true)}}" ]] \
             || bad "go-late: statuses=$(gval statuses) status_ok=$(gval status_ok) answered=$(gval answered)"
         (( $(gval followed) > 1000 && $(gval unit_ok) == $(gval followed) && $(gval inside) == $(gval followed) \
             && ($(gval joined) - $(gval resets) - $(gval followed)) * 100 <= $(gval joined) )) \
-            && ok "go-late: their handlers are followed ($(gval followed) of $(( $(gval joined) - $(gval resets) )) answered)" \
+            && ok "go-late: their handlers are followed ($(gval followed) of $(minus "$(gval joined)" "$(gval resets)") answered)" \
             || bad "go-late: followed=$(gval followed) unit_ok=$(gval unit_ok) inside=$(gval inside) joined=$(gval joined) resets=$(gval resets)"
         ge "$(gval cpu_ok_pct)" 95 && le "$(gval cpu_err_pct)" 5 \
             && ge "$(awk -v e="$(gval cpu_err_pct)" -v r="$(gval runq_pct)" 'BEGIN { print e + r }')" -5 \
@@ -1328,9 +1387,10 @@ sp_suite() {
     sp_run "$rt-off" "$server" 0 8 2000 && {
         # The handler's own CPU is right without the option too.
         ge "$(val cpu_ok_pct)" "$ATTR_OK_PCT_MIN" && le "$(abs "$(val cpu_err_pct)")" "$ATTR_ERR_PCT_MAX" \
+            && (( $(val cpu_n) > 100 )) \
             && ok "$rt: without --deep the handler's CPU is still its own ($(val cpu_ok_pct)%, total $(val cpu_err_pct)%)" \
             || bad "$rt-off: handler CPU: ok $(val cpu_ok_pct)%, total $(val cpu_err_pct)%"
-        (( $(val spawn_count_under) == $(val spawn_n) && $(val spawn_extra_us) == 0 )) \
+        (( $(val spawn_count_under) == $(val spawn_n) && $(val spawn_n) > 100 && $(val spawn_extra_us) == 0 )) \
             && ok "$rt: without --deep no request has spawned units ($(val spawn_n) that did)" \
             || bad "$rt-off: spawn_count_under=$(val spawn_count_under) of $(val spawn_n), extra $(val spawn_extra_us)us"
     }
@@ -1383,7 +1443,7 @@ fs_expect() {
     n=$(val "${key}_n"); other=$(val "${key}_other_us")
     if [[ $key == fsvc ]]; then wrong=$(val fsvc_disk_us); else wrong=$(val io_fsvc_us); fi
     ge "$(val "${key}_ok_pct")" "$ATTR_OK_PCT_MIN" && (( n > 100 )) \
-        && ok "$name: $what per request matches the server's ($(val "${key}_ok_pct")% of $n, $(( $(val "${key}_us") / n ))us each)" \
+        && ok "$name: $what per request matches the server's ($(val "${key}_ok_pct")% of $n, $(isnum "$(val "${key}_us")" && echo $(( $(val "${key}_us") / n )) || echo "?")us each)" \
         || bad "$name: $what: ok $(val "${key}_ok_pct")% of $n"
     (( other <= n * 100 && wrong <= n * 100 )) \
         && ok "$name: none of it left in other (${other}us) or taken for the wrong store (${wrong}us)" \
@@ -1628,11 +1688,12 @@ else
     # Without the option nothing is followed, and nothing is made up.
     omp_run off 4 first && {
         ge "$(val cpu_ok_pct)" "$ATTR_OK_PCT_MIN" && le "$(abs "$(val cpu_err_pct)")" "$ATTR_ERR_PCT_MAX" \
+            && (( $(val cpu_n) > 100 )) \
             && ok "omp: without --deep the handler's CPU is still its own ($(val cpu_ok_pct)%, total $(val cpu_err_pct)%)" \
             || bad "omp-off: handler CPU: ok $(val cpu_ok_pct)%, total $(val cpu_err_pct)%"
         (( $(val spawn_count_under) == $(val spawn_n) && $(val spawn_n) > 100 && $(val spawn_extra_us) == 0 )) \
             && ok "omp: without --deep no request has a team ($(val spawn_n) that opened regions)" \
-            || bad "omp-off: $(( $(val spawn_n) - $(val spawn_count_under) )) of $(val spawn_n) requests have team time without --deep"
+            || bad "omp-off: $(minus "$(val spawn_n)" "$(val spawn_count_under)") of $(val spawn_n) requests have team time without --deep"
     }
 fi
 }

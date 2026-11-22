@@ -147,7 +147,8 @@ def load_kernel(path):
 
 
 def pct(part, whole):
-    return 100.0 * part / whole if whole else 100.0
+    # No samples is not 100% right: nan, which no comparison passes.
+    return 100.0 * part / whole if whole else float("nan")
 
 
 def main():
@@ -317,13 +318,13 @@ def main():
 
     def err_pct(samples):
         total = sum(t for _, t in samples)
-        return 100.0 * (sum(k for k, _ in samples) - total) / total if total else 0.0
+        return 100.0 * (sum(k for k, _ in samples) - total) / total if total else float("nan")
 
     print(
         "check"
         f" truth={len(truth)} kernel={len(kernel)} paired={len(pairs)}"
         f" paired_pct={pct(len(pairs), len(truth)):.2f} spurious={spurious}"
-        f" latency_err_pct={100.0 * (lat_kernel - lat_truth) / lat_truth if lat_truth else 0.0:.2f}"
+        f" latency_err_pct={100.0 * (lat_kernel - lat_truth) / lat_truth if lat_truth else float('nan'):.2f}"
         f" cpu_n={len(cpu)} cpu_ok_pct={ok_pct(cpu):.2f} cpu_err_pct={err_pct(cpu):.2f}"
         f" blk_n={len(blocked)} blk_ok_pct={ok_pct(blocked):.2f} blk_err_pct={err_pct(blocked):.2f}"
         f" down_n={len(down)} down_ok_pct={ok_pct(down):.2f} down_missed={down_missed} down_split={down_split}"
