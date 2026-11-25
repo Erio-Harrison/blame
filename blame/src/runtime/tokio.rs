@@ -259,31 +259,50 @@ fn header_map_entries(minor: u32) -> Option<(u16, u16)> {
 /// The oldest rustc whose `http::HeaderMap` layout is known (above).
 const RUSTC_MIN_MINOR: u32 = 78;
 
-/// h2's functions that are given decoded headers: `Recv::recv_headers`
-/// (one function) and `Send::send_headers` / `send_trailers` (generic: one
-/// instance per body type). The names are in either mangling; an instance's
-/// closures and drop glue have other names that contain these.
-fn is_recv_headers(name: &[u8]) -> bool {
-    let legacy = b"_ZN2h25proto7streams4recv4Recv12recv_headers17h";
-    (name.starts_with(b"_RNvM")
-        && name.ends_with(b"4Recv12recv_headers")
-        && find(name, b"2h25proto7streams4recv").is_some())
-        || (name.starts_with(legacy) && name.len() == legacy.len() + 17 && name.ends_with(b"E"))
+/// A symbol's name without the `.llvm.<digits>` an LTO build may give a
+/// function it made local.
+fn without_llvm_suffix(name: &[u8]) -> &[u8] {
+    match find(name, b".llvm.") {
+        Some(at) if name[at + 6..].iter().all(u8::is_ascii_digit) => &name[..at],
+        _ => name,
+    }
 }
 
-fn is_send(name: &[u8], method: &str) -> bool {
-    let v0 = format!("4Send{}{}I", method.len(), method);
-    let legacy = format!(
-        "_ZN2h25proto7streams4send4Send{}{}17h",
-        method.len(),
-        method
-    );
+/// A legacy-mangled name that is `prefix`, a hash and nothing after:
+/// not a closure, drop glue or a static under the function's path.
+fn legacy_exact(name: &[u8], prefix: &[u8]) -> bool {
+    name.starts_with(prefix)
+        && name.len() == prefix.len() + 17
+        && name[prefix.len()..name.len() - 1]
+            .iter()
+            .all(u8::is_ascii_hexdigit)
+        && name.ends_with(b"E")
+}
+
+/// h2's `<server::Peer as Peer>::convert_poll_message`, given each request's
+/// decoded headers (one function; not the client's, not `Dyn`'s, not its
+/// closures), in either mangling.
+fn is_request(name: &[u8]) -> bool {
+    let name = without_llvm_suffix(name);
+    let legacy =
+        b"$LT$h2..server..Peer$u20$as$u20$h2..proto..peer..Peer$GT$20convert_poll_message17h";
+    (name.starts_with(b"_RNvX")
+        && name.ends_with(b"4Peer20convert_poll_message")
+        && find(name, b"2h26serverNtB").is_some())
+        || find(name, legacy).is_some_and(|at| legacy_exact(name, &name[..at + legacy.len()]))
+}
+
+/// h2's `Prioritize::queue_frame` (generic: one instance per body type),
+/// through which every frame a stream sends goes, in either mangling.
+fn is_queue_frame(name: &[u8]) -> bool {
+    let name = without_llvm_suffix(name);
     (name.starts_with(b"_RINvM")
-        && find(name, b"2h25proto7streams4sendNtB").is_some()
-        && find(name, v0.as_bytes()).is_some())
-        || (name.starts_with(legacy.as_bytes())
-            && name.len() == legacy.len() + 17
-            && name.ends_with(b"E"))
+        && find(name, b"2h25proto7streams10prioritizeNtB").is_some()
+        && find(name, b"10Prioritize11queue_frame").is_some())
+        || legacy_exact(
+            name,
+            b"_ZN2h25proto7streams10prioritize10Prioritize11queue_frame17h",
+        )
 }
 
 /// The probes that read decoded headers, and where the entries are in a
@@ -310,16 +329,9 @@ fn header_probes(elf: &Elf) -> (Vec<Probe>, Option<(u16, u16)>, String) {
             .map(|offset| Probe { at: probe, offset })
             .collect()
     };
-    let recv = at(ProbeAt::RsRecvHeaders, elf.functions_where(is_recv_headers));
-    let mut send = at(
-        ProbeAt::RsSend,
-        elf.functions_where(|name| is_send(name, "send_headers")),
-    );
-    send.extend(at(
-        ProbeAt::RsSend,
-        elf.functions_where(|name| is_send(name, "send_trailers")),
-    ));
-    if recv.is_empty() || send.is_empty() {
+    let request = at(ProbeAt::RsRequest, elf.functions_where(is_request));
+    let queue = at(ProbeAt::RsQueueFrame, elf.functions_where(is_queue_frame));
+    if request.is_empty() || queue.is_empty() {
         return (
             Vec::new(),
             None,
@@ -329,9 +341,11 @@ fn header_probes(elf: &Elf) -> (Vec<Probe>, Option<(u16, u16)>, String) {
         );
     }
     (
-        recv.into_iter().chain(send).collect(),
+        request.into_iter().chain(queue).collect(),
         Some(entries),
-        format!("headers of older connections read (rustc {rustc})"),
+        format!(
+            "headers of older connections read in the process where what is read there holds together (rustc {rustc}; h2_process_unread counts what did not)"
+        ),
     )
 }
 
@@ -639,36 +653,43 @@ mod tests {
 
     #[test]
     fn h2_functions_are_told_from_their_closures_and_glue() {
-        let recv = b"_RNvMNtNtNtCscfuFiw2yFZd_2h25proto7streams4recvNtB2_4Recv12recv_headers";
-        assert!(is_recv_headers(recv));
-        // A closure of the transition in which recv_headers runs.
-        let other = b"_RINvMs_NtNtNtCscfuFiw2yFZd_2h25proto7streams6countsNtB5_6Counts10transitionNCINvMs0_NtB7_7streamsNtB1k_5Inner12recv_headersINtNtNtCs6Mrnt9d0Mck_5hyper5proto2h27SendBuf";
-        assert!(!is_recv_headers(other));
-        let trailers = b"_RINvMNtNtNtCscfuFiw2yFZd_2h25proto7streams4sendNtB3_4Send13send_trailersINtNtNtCs6Mrnt9d0Mck_5hyper5proto2h27SendBufNtNtCs1vy9UVDIxJm_5bytes5bytes5BytesEECs75Zz1MCb1aC_11tonic_truth";
-        assert!(is_send(trailers, "send_trailers"));
-        assert!(!is_send(trailers, "send_headers"));
-        // The stream-level function of the same name, and drop glue.
-        let stream = b"_RINvMs_NtNtNtCscfuFiw2yFZd_2h25proto7streams7streamsINtB4_9StreamRefINtNtNtCs6Mrnt9d0Mck_5hyper5proto2h27SendBuf13send_trailers";
-        assert!(!is_send(stream, "send_trailers"));
-        // The older mangling: the name, a hash, and nothing after (h2 in
-        // tonic_truth, built by rustc 1.93 with its default, legacy, one).
-        assert!(is_recv_headers(
-            b"_ZN2h25proto7streams4recv4Recv12recv_headers17h20938fa9c4ebce10E"
+        let request = b"_RNvXsc_NtCsdM6mQcSP6jh_2h26serverNtB5_4PeerNtNtNtB7_5proto4peer4Peer20convert_poll_message";
+        assert!(is_request(request));
+        // Made local by LTO.
+        assert!(is_request(
+            b"_RNvXsc_NtCsdM6mQcSP6jh_2h26serverNtB5_4PeerNtNtNtB7_5proto4peer4Peer20convert_poll_message.llvm.512521666128096454"
         ));
-        assert!(is_send(
-            b"_ZN2h25proto7streams4send4Send13send_trailers17h4ca579d4202438afE",
-            "send_trailers"
+        // The client's, `Dyn`'s, and a closure in it.
+        assert!(!is_request(
+            b"_RNvXse_NtCsdM6mQcSP6jh_2h26clientNtB5_4PeerNtNtNtB7_5proto4peer4Peer20convert_poll_message"
         ));
-        assert!(!is_recv_headers(
-            b"_ZN2h25proto7streams4recv4Recv12recv_headers17h20938fa9c4ebce10E.llvm.1"
+        assert!(!is_request(
+            b"_RNvMNtNtCs59ZrB36NNY5_2h25proto4peerNtB2_3Dyn20convert_poll_message"
         ));
-        // tracing's statics for the function's events: data, under its path.
-        assert!(!is_recv_headers(
-            b"_ZN2h25proto7streams4recv4Recv12recv_headers10__CALLSITE17h1752c9052d4650a0E"
+        assert!(!is_request(
+            b"_RNCNvXsc_NtCsdM6mQcSP6jh_2h26serverNtB7_4PeerNtNtNtB9_5proto4peer4Peer20convert_poll_messages0_0B9_"
         ));
-        assert!(!is_send(
-            b"_ZN2h25proto7streams4send4Send13send_trailers10__CALLSITE17hd8e0dd3021355e0eE",
-            "send_trailers"
+        let queue = b"_RINvMNtNtNtCsdM6mQcSP6jh_2h25proto7streams10prioritizeNtB3_10Prioritize11queue_frameINtNtNtCs6XXGbUYLpGa_5hyper5proto2h27SendBufNtNtCsdA98wz12ABL_5bytes5bytes5BytesEECs5NKRXVsIRGr_6qdrant";
+        assert!(is_queue_frame(queue));
+        // tracing's static for the function's events: data, under its path.
+        assert!(!is_queue_frame(
+            b"_RNvNvMNtNtNtCs3qDEvan1Rmb_2h25proto7streams10prioritizeNtB4_10Prioritize11queue_frame10___CALLSITE"
+        ));
+        // The older mangling: the name, a hash, and nothing after.
+        assert!(is_request(
+            b"_ZN85_$LT$h2..server..Peer$u20$as$u20$h2..proto..peer..Peer$GT$20convert_poll_message17h20938fa9c4ebce10E"
+        ));
+        assert!(!is_request(
+            b"_ZN85_$LT$h2..client..Peer$u20$as$u20$h2..proto..peer..Peer$GT$20convert_poll_message17h20938fa9c4ebce10E"
+        ));
+        assert!(!is_request(
+            b"_ZN85_$LT$h2..server..Peer$u20$as$u20$h2..proto..peer..Peer$GT$20convert_poll_message28_$u7b$$u7b$closure$u7d$$u7d$17h20938fa9c4ebce10E"
+        ));
+        assert!(is_queue_frame(
+            b"_ZN2h25proto7streams10prioritize10Prioritize11queue_frame17h4ca579d4202438afE"
+        ));
+        assert!(!is_queue_frame(
+            b"_ZN2h25proto7streams10prioritize10Prioritize11queue_frame10__CALLSITE17hd8e0dd3021355e0eE"
         ));
     }
 

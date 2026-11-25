@@ -20,6 +20,8 @@ stream id, where the server logs those. Prints one line:
   answered      joined calls the call was not over before the handler's end (not reset or given up)
   statuses      of those, reported with a gRPC status
   status_ok     of those, with the status the server answered with
+  status_untimed, timed_no_status   answered calls with a status and no time
+                attributed, and the other way round
   trace_wrong   reported calls whose trace id is one that no call of the run had
   followed      joined calls with time attributed to them
   unit_ok       of those, attributed to the goroutine or task that ran them
@@ -153,6 +155,7 @@ def main():
     known = {t for t, *_ in served} | set(given_up)
     trace_wrong = sum(1 for k in by_trace.values() if k["trace"] not in known)
     joined = traced = paths = path_ok = statuses = status_ok = answered = 0
+    status_untimed = timed_no_status = 0
     followed = unit_ok = inside = cpu_ok = 0
     handler_timed = before_ok = after_ok = before_sum = after_sum = 0
     handler_timed_cpu_ok = parts_ok_cpu_ok = late_followed = late_untimed = 0
@@ -195,6 +198,8 @@ def main():
         if k["grpc_status"] >= 0:
             statuses += 1
             status_ok += k["grpc_status"] == status
+        status_untimed += k["grpc_status"] >= 0 and k["observed_ns"] == 0
+        timed_no_status += k["grpc_status"] < 0 and k["observed_ns"] > 0
         if k["observed_ns"] == 0:
             continue
         followed += 1
@@ -243,6 +248,7 @@ def main():
     print(
         f"grpc served={len(served)} reported={total} named={named} with_trace={with_trace} joined={joined} by_trace={traced}"
         f" paths={paths} path_ok={path_ok} answered={answered} statuses={statuses} status_ok={status_ok}"
+        f" status_untimed={status_untimed} timed_no_status={timed_no_status}"
         f" trace_wrong={trace_wrong} dup_trace={dup_trace}"
         f" followed={followed} unit_ok={unit_ok}"
         f" inside={inside} cpu_ok_pct={100 * cpu_ok / followed if followed else 0:.2f}"

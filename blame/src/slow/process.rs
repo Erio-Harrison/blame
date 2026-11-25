@@ -97,8 +97,8 @@ fn attach_probes(skel: &Skel, pid: u32, probes: &[Probe]) -> Result<Vec<Link>> {
                 at(&progs.up_go_newproc, false)?;
                 at(&progs.up_go_newproc_ret, true)?;
             }
-            ProbeAt::RsRecvHeaders => at(&progs.up_rs_recv_headers, false)?,
-            ProbeAt::RsSend => at(&progs.up_rs_send, false)?,
+            ProbeAt::RsRequest => at(&progs.up_rs_request, false)?,
+            ProbeAt::RsQueueFrame => at(&progs.up_rs_queue_frame, false)?,
             ProbeAt::TokioPoll => {
                 at(&progs.up_tokio_poll, false)?;
                 at(&progs.up_tokio_poll_ret, true)?;

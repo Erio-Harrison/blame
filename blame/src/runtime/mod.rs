@@ -61,10 +61,12 @@ pub enum ProbeAt {
     GoPark,
     /// Go: `runtime.goexit0`, where a goroutine that has returned leaves its thread.
     GoExit,
-    /// Rust h2: `Recv::recv_headers`, with a request's decoded headers.
-    RsRecvHeaders,
-    /// Rust h2: `Send::send_headers` or `send_trailers`, with a response's.
-    RsSend,
+    /// Rust h2: `server::Peer::convert_poll_message`, with a request's
+    /// decoded headers.
+    RsRequest,
+    /// Rust h2: `Prioritize::queue_frame`, with every frame a stream sends,
+    /// a response's headers and trailers among them.
+    RsQueueFrame,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

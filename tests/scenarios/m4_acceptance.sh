@@ -1285,13 +1285,18 @@ if [[ -n "${GO_CMD:=${GO:-$(command -v go || true)}}" ]] \
             (( $(gval statuses) * 100 >= $(gval answered) * 97 && $(gval statuses) == $(gval status_ok) )) \
                 && ok "tonic-late: nearly all answered calls have their status ($(gval statuses) of $(gval answered)), all the server's" \
                 || bad "tonic-late: statuses=$(gval statuses) status_ok=$(gval status_ok) answered=$(gval answered)"
+            # The status is read in the task that serves the call, as its
+            # time is: a call has both or neither.
+            (( $(gval status_untimed) == 0 && $(gval timed_no_status) == 0 )) \
+                && ok "tonic-late: a call has its status exactly when its handler is followed ($(( $(gval answered) - $(gval statuses) )) have neither)" \
+                || bad "tonic-late: status_untimed=$(gval status_untimed) timed_no_status=$(gval timed_no_status)"
             # Every call begun after attaching has the two parts.
             if (( $(gval late_followed) > 1000 && $(gval late_untimed) == 0 )); then
                 handler_parts tonic-late
             else
                 bad "tonic-late: late_followed=$(gval late_followed) late_untimed=$(gval late_untimed)"
             fi
-            expect_no_loss tonic-late "$WORK/g_tonic-late.log" grpc_handoff_unmatched req_h2_lost
+            expect_no_loss tonic-late "$WORK/g_tonic-late.log" grpc_handoff_unmatched req_h2_lost h2_process_unread
         }
         # No trace header: the method is the only thing the process has to say.
         NO_TRACEPARENT=1 grpc_late tonic-late-notrace "U,U" "$GRPC_PARAMS" hello -- "$GT_TARGET/release/tonic_truth" && {

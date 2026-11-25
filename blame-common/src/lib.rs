@@ -540,10 +540,15 @@ pub enum Counter {
     /// what each process ran and waited on each CPU: its threads' waits
     /// there, and what they ran there, are not counted.
     ProcCpuInsertFailed = 35,
+    /// A probe in a server process was given a request's headers or its
+    /// status, on a connection whose header blocks cannot be decoded here,
+    /// and what it read there did not hold together: the request's method
+    /// and trace id, or its status, are not known from the process.
+    H2ProcessUnread = 36,
 }
 
 /// Number of slots in the counter array.
-pub const COUNTER_MAX: u32 = 36;
+pub const COUNTER_MAX: u32 = 37;
 
 impl Counter {
     pub const ALL: [Self; COUNTER_MAX as usize] = [
@@ -583,6 +588,7 @@ impl Counter {
         Self::OmpRegionUnfollowed,
         Self::OmpTeamIdleCpuNs,
         Self::ProcCpuInsertFailed,
+        Self::H2ProcessUnread,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -623,6 +629,7 @@ impl Counter {
             Self::OmpRegionUnfollowed => "omp_region_unfollowed",
             Self::OmpTeamIdleCpuNs => "omp_team_idle_cpu_ns",
             Self::ProcCpuInsertFailed => "proc_cpu_insert_failed",
+            Self::H2ProcessUnread => "h2_process_unread",
         }
     }
 
@@ -666,7 +673,8 @@ impl Counter {
             | Self::UnitReadInconsistent
             | Self::ReqH2Lost
             | Self::ReqStreamInsertFailed
-            | Self::GrpcHandoffUnmatched => true,
+            | Self::GrpcHandoffUnmatched
+            | Self::H2ProcessUnread => true,
         }
     }
 }

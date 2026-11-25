@@ -497,7 +497,16 @@ enum counter {
 	 * threads' waits there, and what they ran there, are not counted.
 	 */
 	PROC_CPU_INSERT_FAILED = 35,
-	COUNTER_MAX = 36,
+	/*
+	 * A probe in a server process was given a request's headers or its
+	 * status, on a connection whose header blocks cannot be decoded here,
+	 * and what it read there did not hold together (where the arguments
+	 * are could not be told, or the stream is not the request's): the
+	 * request's method and trace id, or its status, are not known from the
+	 * process. The process's layout is not the one these probes know.
+	 */
+	H2_PROCESS_UNREAD = 36,
+	COUNTER_MAX = 37,
 };
 
 struct runq_hist {

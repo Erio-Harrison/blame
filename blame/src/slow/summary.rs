@@ -120,6 +120,7 @@ pub(super) fn kernel_line(counters: &Counters) -> String {
         Counter::ReqH2Lost,
         Counter::ReqStreamInsertFailed,
         Counter::GrpcHandoffUnmatched,
+        Counter::H2ProcessUnread,
         Counter::ProcCpuInsertFailed,
         Counter::RingbufFull,
     ]
