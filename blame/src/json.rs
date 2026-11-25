@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 
 use crate::{
     h2meta::Meta,
-    methods::{Method, Row},
+    methods::{Method, OffThread, Row},
     runq::{Hist, summary},
     slow::proc_cpu::ProcCpu,
     stats::Counters,
@@ -172,6 +172,8 @@ pub fn call(
         if let Some(why) = parked(&event.parked(), 1) {
             time.insert("off_thread_by_why".into(), why);
         }
+        let parts = OffThread::of(event, latency.saturating_sub(on_thread));
+        time.insert("not_seen_ns".into(), json!(parts.not_seen_ns));
     }
     if event.helpers > 0 {
         fields.insert(
@@ -293,6 +295,9 @@ pub fn method(window_s: Option<u64>, service: Option<&str>, row: &Row) -> Value 
             "blocked_file_service_ns": mean(s.file_service_ns),
             "blocked_other_ns": mean(s.blocked_other_ns),
             "off_thread_ns": mean(s.off_thread_ns),
+            "before_handler_ns": mean(s.before_handler_ns),
+            "after_handler_ns": mean(s.after_handler_ns),
+            "not_seen_ns": mean(s.not_seen_ns),
         })),
         "off_thread_by_why_mean": parked(&s.parked_ns, s.timed),
         "spawned_mean": (s.spawned > 0).then(|| json!({
@@ -413,7 +418,8 @@ pub fn fields() -> Value {
                 "time.off_thread_ns": "The rest of the duration: the handler was on no thread (a goroutine or task that is parked: waiting for a downstream call, a lock, a channel, or the runtime's scheduler), or the request was waiting for a handler. Cannot be split further from outside the process.",
                 "time.before_handler_ns": "Of `off_thread_ns`, when a runtime handed the request to a handler (gRPC in Go and tokio) and its switches were followed exactly: from the start to when the handler first ran. The runtime's own goroutines or tasks had it: the one reading the connection had not got to it yet, or the new handler was waiting to be run. Absent when not known.",
                 "time.after_handler_ns": "Of `off_thread_ns`, likewise: from when the handler last left its thread to the end, if it did not run again. It was done; the runtime's own goroutines or tasks were writing the response. Absent when not known.",
-                "time.off_thread_by_why": "Only with `--deep`: of `off_thread_ns`, where the request's goroutine or task was, by why, in ns: {runnable_ns, channel_ns, sync_ns, sleep_ns, network_ns, gc_ns, other_ns, task_ns, blocking_ns}. Go: from why the goroutine parked: runnable (taken off its thread and waiting to run again: more runnable goroutines than GOMAXPROCS lets run), channel, sync (Mutex, RWMutex, Cond, WaitGroup), sleep, network (waiting for a socket in Go's poller), gc, other; each includes, after the goroutine was woken, any wait for a thread to run it; task and blocking are 0. tokio (multi-thread and current-thread runtimes): from what woke the task, up to the wake: network (the I/O driver: a socket or another event source), sleep (a timer), task (another task: a channel, a lock, a join handle, not told apart), blocking (the blocking pool finished work for it), other (anything else); runnable is from the wake to its next poll, and the time of a task woken while it ran. What is left of off_thread_ns, less `before_handler_ns` and `after_handler_ns`, was not seen. Absent if nothing was seen.",
+                "time.off_thread_by_why": "Only with `--deep`: of `off_thread_ns`, where the request's goroutine or task was, by why, in ns: {runnable_ns, channel_ns, sync_ns, sleep_ns, network_ns, gc_ns, other_ns, task_ns, blocking_ns}. Go: from why the goroutine parked: runnable (taken off its thread and waiting to run again: more runnable goroutines than GOMAXPROCS lets run), channel, sync (Mutex, RWMutex, Cond, WaitGroup), sleep, network (waiting for a socket in Go's poller), gc, other; each includes, after the goroutine was woken, any wait for a thread to run it; task and blocking are 0. tokio (multi-thread and current-thread runtimes): from what woke the task, up to the wake: network (the I/O driver: a socket or another event source), sleep (a timer), task (another task: a channel, a lock, a join handle, not told apart), blocking (the blocking pool finished work for it), other (anything else); runnable is from the wake to its next poll, and the time of a task woken while it ran. What is left of off_thread_ns, less `before_handler_ns` and `after_handler_ns`, was not seen: `not_seen_ns`. Absent if nothing was seen.",
+                "time.not_seen_ns": "Of `off_thread_ns`, what is left after `before_handler_ns`, `after_handler_ns` and `off_thread_by_why`: off any thread, and nothing seen says why (all of `off_thread_ns` when none of those is there). The four add up to `off_thread_ns`.",
                 "stream": "http2: the stream id on its connection.",
                 "method": "http2: the request's :path; for gRPC `/package.Service/Method`. null: not known. On a connection older than the agent the header blocks cannot be decoded; the method then comes from the process itself where it is read there (see `process.note`: grpc-go, and tonic with symbols), else once the client spells it out again.",
                 "trace_id": "The trace id of the request's W3C `traceparent` header: the 32 hex digits after the two of the version, where the value is laid out so (`vv-<32 hex>-...`), not all zero; otherwise not taken. null: the request had none, or it is not known. http1: read from the request's headers as they arrive. http2: on a connection older than the agent only a process whose headers are read (see `process.note`) gives it, and not for a request whose headers were read before the agent was attached.",
@@ -452,7 +458,7 @@ pub fn fields() -> Value {
                 "p99_ns": "As in `service`.",
                 "max_ns": "The longest request, exactly.",
                 "timed": "Requests whose handler was followed. `time_mean` is over these only.",
-                "time_mean": "Mean per timed request of the fields of `call.time`. null if `timed` is 0.",
+                "time_mean": "Mean per timed request of the fields of `call.time`; a request without `before_handler_ns` or `after_handler_ns` counts 0 there, so `before_handler_ns`, `after_handler_ns`, `not_seen_ns` and the sum of `off_thread_by_why_mean` add up to `off_thread_ns` (within rounding). null if `timed` is 0.",
                 "off_thread_by_why_mean": "Mean per timed request of `call.time.off_thread_by_why`. null if none was seen.",
                 "spawned_mean": "Only with `--deep`: mean per timed request of `call.spawned` (`count` is the mean number of units spawned; `blocked_other_ns` includes their downstream and client waits). Not part of `time_mean`, and can exceed the latency. null if no timed request spawned any.",
             },

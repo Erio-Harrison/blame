@@ -1166,7 +1166,7 @@ if [[ -n "${GO_CMD:=${GO:-$(command -v go || true)}}" ]] \
                 && ok "nothing slow enough to list: the summary by method is complete all the same" \
                 || bad "quiet: reported=$(gval reported) methods=$(gval m_paths) calls_ok=$(gval m_calls_ok) ends_ok=$(gval m_ends_ok)"
         else
-            grep -qE '^  service +method +calls +errors +reset +p50 +p99 +max +on_cpu +runq +disk +fileservice +memory +other +off_thread$' "$q.log" \
+            grep -qE '^  service +method +calls +errors +reset +p50 +p99 +max +on_cpu +runq +disk +fileservice +memory +other +off_thread +before +after +parked +not_seen$' "$q.log" \
                 && (( $(grep -cE '^  \S+ +/x\.S/(U|SS|CS|BI) +[0-9]+ +[0-9]+ +[0-9]+ ' "$q.log") == 4 )) \
                 && ok "the summary for people is a table with a row per method" \
                 || bad "no method table: $(grep -m3 -A3 'method' "$q.log")"

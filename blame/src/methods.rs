@@ -11,8 +11,8 @@
 use std::{collections::HashMap, rc::Rc};
 
 use blame_common::{
-    REQ_F_HTTP2, REQ_F_LINE_TRUNCATED, REQ_F_RESET_CLIENT, REQ_F_RESET_SERVER, RUNQ_BUCKETS,
-    RequestEvent, runq_bucket,
+    REQ_F_HANDLER_TIMED, REQ_F_HTTP2, REQ_F_LINE_TRUNCATED, REQ_F_RESET_CLIENT, REQ_F_RESET_SERVER,
+    RUNQ_BUCKETS, RequestEvent, runq_bucket,
 };
 
 use crate::{
@@ -58,6 +58,36 @@ fn is_id(segment: &str) -> bool {
         });
     !b.is_empty()
         && (b.iter().all(u8::is_ascii_digit) || uuid || (b.len() >= 16 && b.iter().all(hex)))
+}
+
+/// A request's time off any thread (`off_thread_ns`), in parts that add up
+/// to it: before its handler first ran and after it last left its thread
+/// (when the runtime's switches were followed exactly), parked, by why
+/// (`--deep`), and the rest, which nothing split (`not_seen_ns`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OffThread {
+    pub before_handler_ns: u64,
+    pub after_handler_ns: u64,
+    pub parked_ns: u64,
+    pub not_seen_ns: u64,
+}
+
+impl OffThread {
+    pub fn of(event: &RequestEvent, off_thread_ns: u64) -> Self {
+        let (before_handler_ns, after_handler_ns) = if event.flags & REQ_F_HANDLER_TIMED != 0 {
+            (event.before_handler_ns, event.after_handler_ns)
+        } else {
+            (0, 0)
+        };
+        let parked_ns: u64 = event.parked().iter().sum();
+        Self {
+            before_handler_ns,
+            after_handler_ns,
+            parked_ns,
+            not_seen_ns: off_thread_ns
+                .saturating_sub(before_handler_ns + after_handler_ns + parked_ns),
+        }
+    }
 }
 
 /// What a row is about.
@@ -106,6 +136,11 @@ pub struct Stats {
     pub file_service_ns: u64,
     pub blocked_other_ns: u64,
     pub off_thread_ns: u64,
+    /// `off_thread_ns` in parts (see [`OffThread`]); the by-why part is
+    /// `parked_ns` below.
+    pub before_handler_ns: u64,
+    pub after_handler_ns: u64,
+    pub not_seen_ns: u64,
     /// Of the timed requests: the goroutines and tasks they spawned
     /// (`--deep`), and the time of those, by what they did.
     pub spawned: u64,
@@ -140,6 +175,9 @@ impl Default for Stats {
             file_service_ns: 0,
             blocked_other_ns: 0,
             off_thread_ns: 0,
+            before_handler_ns: 0,
+            after_handler_ns: 0,
+            not_seen_ns: 0,
             spawned: 0,
             spawned_cpu_ns: 0,
             spawned_runq_ns: 0,
@@ -198,7 +236,12 @@ impl Stats {
             self.memory_ns += event.blocked_mem_ns;
             self.file_service_ns += event.blocked_fsvc_ns;
             self.blocked_other_ns += blocked_other;
-            self.off_thread_ns += latency.saturating_sub(on_thread);
+            let off_thread = latency.saturating_sub(on_thread);
+            let parts = OffThread::of(event, off_thread);
+            self.off_thread_ns += off_thread;
+            self.before_handler_ns += parts.before_handler_ns;
+            self.after_handler_ns += parts.after_handler_ns;
+            self.not_seen_ns += parts.not_seen_ns;
             self.spawned += u64::from(event.helpers);
             self.spawned_cpu_ns += event.helper_cpu_ns;
             self.spawned_runq_ns += event.helper_runq_ns;
@@ -233,6 +276,9 @@ impl Stats {
         self.file_service_ns += other.file_service_ns;
         self.blocked_other_ns += other.blocked_other_ns;
         self.off_thread_ns += other.off_thread_ns;
+        self.before_handler_ns += other.before_handler_ns;
+        self.after_handler_ns += other.after_handler_ns;
+        self.not_seen_ns += other.not_seen_ns;
         self.spawned += other.spawned;
         self.spawned_cpu_ns += other.spawned_cpu_ns;
         self.spawned_runq_ns += other.spawned_runq_ns;
@@ -344,7 +390,7 @@ fn fmt_ns(ns: u64) -> String {
 
 /// The summary for a person. Times of the handlers are averages per request
 /// that had a handler followed; `timed` says how many those were when it is
-/// not all of them.
+/// not all of them. The last four split `off_thread` and add up to it.
 pub fn render(rows: &[Row], limit: usize) -> String {
     if rows.is_empty() {
         return String::new();
@@ -365,7 +411,7 @@ pub fn render(rows: &[Row], limit: usize) -> String {
         .max(6)
         + 2;
     let mut out = format!(
-        "  {:<service_width$}{:<method_width$}{:>9}{:>8}{:>7}{:>9}{:>9}{:>9}  {:>8}{:>8}{:>8}{:>12}{:>8}{:>8}{:>11}\n",
+        "  {:<service_width$}{:<method_width$}{:>9}{:>8}{:>7}{:>9}{:>9}{:>9}  {:>8}{:>8}{:>8}{:>12}{:>8}{:>8}{:>11}  {:>8}{:>8}{:>8}{:>9}\n",
         "service",
         "method",
         "calls",
@@ -380,7 +426,11 @@ pub fn render(rows: &[Row], limit: usize) -> String {
         "fileservice",
         "memory",
         "other",
-        "off_thread"
+        "off_thread",
+        "before",
+        "after",
+        "parked",
+        "not_seen"
     );
     for row in shown {
         let s = &row.stats;
@@ -390,7 +440,7 @@ pub fn render(rows: &[Row], limit: usize) -> String {
             timed => fmt_ns(sum / timed),
         };
         out += &format!(
-            "  {:<service_width$}{:<method_width$}{:>9}{:>8}{:>7}{:>9}{:>9}{:>9}  {:>8}{:>8}{:>8}{:>12}{:>8}{:>8}{:>11}",
+            "  {:<service_width$}{:<method_width$}{:>9}{:>8}{:>7}{:>9}{:>9}{:>9}  {:>8}{:>8}{:>8}{:>12}{:>8}{:>8}{:>11}  {:>8}{:>8}{:>8}{:>9}",
             row.service,
             row.method.text(),
             s.calls,
@@ -406,6 +456,10 @@ pub fn render(rows: &[Row], limit: usize) -> String {
             mean(s.memory_ns),
             mean(s.blocked_other_ns),
             mean(s.off_thread_ns),
+            mean(s.before_handler_ns),
+            mean(s.after_handler_ns),
+            mean(s.parked_ns.iter().sum()),
+            mean(s.not_seen_ns),
         );
         if s.timed != 0 && s.timed != s.calls {
             out += &format!("  ({} timed)", s.timed);
@@ -441,7 +495,8 @@ pub fn render_raw(rows: &[Row]) -> String {
         out += &format!(
             "method calls={} ok={} errors={} status_unknown={} reset_client={} reset_server={} \
              p50_ns={} p99_ns={} max_ns={} timed={} cpu_ns={} runq_ns={} disk_ns={} file_service_ns={} memory_ns={} \
-             blocked_other_ns={} off_thread_ns={} service={} path={}\n",
+             blocked_other_ns={} off_thread_ns={} before_handler_ns={} after_handler_ns={} parked_ns={} \
+             not_seen_ns={} service={} path={}\n",
             s.calls,
             s.ok,
             s.errors,
@@ -459,6 +514,10 @@ pub fn render_raw(rows: &[Row]) -> String {
             s.memory_ns,
             s.blocked_other_ns,
             s.off_thread_ns,
+            s.before_handler_ns,
+            s.after_handler_ns,
+            s.parked_ns.iter().sum::<u64>(),
+            s.not_seen_ns,
             field(&row.service),
             match &row.method {
                 Method::Path(path) => field(path),
@@ -599,6 +658,70 @@ mod tests {
         assert!(raw.contains(" timed=2 cpu_ns=6000000 "));
         assert!(raw.contains(" service=shop.service path=/s.S/A\n"));
         assert!(raw.contains(" path=-\n"));
+    }
+
+    #[test]
+    fn the_parts_of_a_method_add_up_to_the_time_of_its_requests() {
+        let mut methods = Methods::default();
+        let mut total_ns = 0;
+        // Off the thread: before and after the handler, parked by why, and
+        // the rest; with and without each, as runtimes report them.
+        for i in 0..6u64 {
+            let mut e = call(7, 40 + i, 0, 3);
+            e.runq_ns = 1_000_000;
+            e.blocked_io_ns = 2_000_000;
+            e.blocked_down_ns = 500_000;
+            if i % 2 == 0 {
+                e.flags |= REQ_F_HANDLER_TIMED;
+                e.before_handler_ns = 4_000_000 + i;
+                e.after_handler_ns = 1_000_000;
+            }
+            if i % 3 == 0 {
+                e.parked_ns[1] = 7_000_000;
+                e.parked_task_ns = 2_000_000;
+            }
+            total_ns += e.latency_ns();
+            methods.add(&e, Some(&meta("/s.S/A", Some(0))));
+        }
+        // Not timed: no part of it is counted.
+        let mut untimed = call(7, 90, 0, 0);
+        untimed.observed_ns = 0;
+        methods.add(&untimed, Some(&meta("/s.S/A", Some(0))));
+
+        let s = &methods.total()[&(7, Method::Path("/s.S/A".into()))];
+        let parked: u64 = s.parked_ns.iter().sum();
+        assert_eq!(
+            s.before_handler_ns + s.after_handler_ns + parked + s.not_seen_ns,
+            s.off_thread_ns
+        );
+        assert_eq!(
+            s.cpu_ns
+                + s.runq_ns
+                + s.disk_ns
+                + s.memory_ns
+                + s.file_service_ns
+                + s.blocked_other_ns
+                + s.off_thread_ns,
+            total_ns
+        );
+        assert_eq!(
+            (s.before_handler_ns, s.after_handler_ns, parked),
+            (12_000_006, 3_000_000, 18_000_000)
+        );
+        // In every rendering.
+        let rows = rows(methods.total(), |_| "s".to_string());
+        let raw = render_raw(&rows);
+        assert!(raw.contains(&format!(
+            " off_thread_ns={} before_handler_ns=12000006 after_handler_ns=3000000 parked_ns=18000000 not_seen_ns={} ",
+            s.off_thread_ns, s.not_seen_ns
+        )));
+        let text = render(&rows, 20);
+        assert!(
+            text.lines()
+                .next()
+                .unwrap()
+                .ends_with(" off_thread    before   after  parked not_seen")
+        );
     }
 
     #[test]

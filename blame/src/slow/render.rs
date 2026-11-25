@@ -6,7 +6,8 @@ use blame_common::{
 };
 
 use crate::{
-    consume::format_wall_clock, h2meta::Meta, identity::UNATTRIBUTED, runq::fmt_opt, top::fmt_us,
+    consume::format_wall_clock, h2meta::Meta, identity::UNATTRIBUTED, methods::OffThread,
+    runq::fmt_opt, top::fmt_us,
 };
 
 pub(super) fn fmt_ns(ns: u64) -> String {
@@ -151,15 +152,14 @@ fn parked_line(event: &RequestEvent, off_thread_ns: u64) -> String {
         return String::new();
     }
     let mut parts = Vec::new();
-    let mut known = seen;
+    let split = OffThread::of(event, off_thread_ns);
     // Before the handler first ran, after it last left its thread.
     if timed {
         parts.push(format!(
             "before_handler={}",
-            fmt_ns(event.before_handler_ns)
+            fmt_ns(split.before_handler_ns)
         ));
-        parts.push(format!("after_handler={}", fmt_ns(event.after_handler_ns)));
-        known += event.before_handler_ns + event.after_handler_ns;
+        parts.push(format!("after_handler={}", fmt_ns(split.after_handler_ns)));
     }
     // Why the handler was off its thread in between (--deep). The last
     // two are tokio's alone: shown when there is any.
@@ -172,11 +172,9 @@ fn parked_line(event: &RequestEvent, off_thread_ns: u64) -> String {
                 .filter(|&(i, (_, ns))| i < 7 || ns > 0)
                 .map(|(_, (name, ns))| format!("{name}={}", fmt_ns(ns))),
         );
-        parts.push(format!(
-            "not_seen={}",
-            fmt_ns(off_thread_ns.saturating_sub(known))
-        ));
     }
+    // The parts add up to off_thread.
+    parts.push(format!("not_seen={}", fmt_ns(split.not_seen_ns)));
     format!("      off_thread: {}\n", parts.join(" "))
 }
 
@@ -629,7 +627,10 @@ mod tests {
         e.before_handler_ns = 12_000_000;
         e.after_handler_ns = 0;
         let out = render_request(&e, None, "shop.service", 0);
-        assert!(out.contains("      off_thread: before_handler=12.0ms after_handler=0us\n"));
+        // The rest of the 100 ms off the thread: not seen why.
+        assert!(out.contains(
+            "      off_thread: before_handler=12.0ms after_handler=0us not_seen=88.0ms\n"
+        ));
         // Not known: not shown.
         e.flags &= !REQ_F_HANDLER_TIMED;
         assert!(!render_request(&e, None, "shop.service", 0).contains("off_thread:"));
