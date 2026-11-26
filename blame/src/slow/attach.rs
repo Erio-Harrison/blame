@@ -14,7 +14,7 @@ use libbpf_rs::{
 use super::{
     SlowOpt,
     fsvc::{FSVC_PREFIX, attach_fsvc, fsvc_function, fsvc_present},
-    process::{ProcessNote, inspect_and_attach},
+    process::{ProcessNote, follow_tls, inspect_and_attach},
 };
 use crate::{
     bpf::{self, Skel},
@@ -265,7 +265,7 @@ pub(super) fn attach(opt: &SlowOpt) -> Result<Attached> {
         &opt.pids
     };
     let mut procs_left_out = 0usize;
-    let mut notes = Vec::new();
+    let mut found_in = Vec::new();
     let mut probe_links = Vec::new();
     for pid in traced {
         let (found, links) = inspect_and_attach(&skel, opt, *pid);
@@ -278,7 +278,7 @@ pub(super) fn attach(opt: &SlowOpt) -> Result<Attached> {
         {
             procs_left_out += 1;
         } else {
-            notes.push(ProcessNote::of(*pid, &found));
+            found_in.push((*pid, found));
         }
     }
     // The scheduler hook passes over threads of processes without a bit here.
@@ -287,8 +287,8 @@ pub(super) fn attach(opt: &SlowOpt) -> Result<Attached> {
         .bss_data
         .as_deref_mut()
         .context("the eBPF object has no zero-initialised data")?;
-    for note in &notes {
-        let bit = note.pid as usize % (bits.proc_bits.len() * 64);
+    for (pid, _) in &found_in {
+        let bit = *pid as usize % (bits.proc_bits.len() * 64);
         bits.proc_bits[bit / 64] |= 1 << (bit % 64);
     }
     if procs_left_out > 0 {
@@ -322,6 +322,14 @@ pub(super) fn attach(opt: &SlowOpt) -> Result<Attached> {
         // SAFETY: a link libbpf just made, owned by no one else.
         links.push(unsafe { Link::from_ptr(link) });
     }
+    // The TLS probes start requests too: only now that the rest is on.
+    let notes = found_in
+        .into_iter()
+        .map(|(pid, mut found)| {
+            probe_links.extend(follow_tls(&skel, opt, pid, &mut found));
+            ProcessNote::of(pid, &found)
+        })
+        .collect();
 
     let bytes = |map: &dyn MapCore| {
         u64::from(map.max_entries()) * u64::from(map.key_size() + map.value_size())

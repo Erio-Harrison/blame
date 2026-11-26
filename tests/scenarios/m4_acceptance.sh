@@ -34,6 +34,9 @@
 # [14] OpenMP        the threads of a team that take up a request's parallel
 #                    work (GNU libgomp): their CPU and their wait for a CPU,
 #                    against a server that opens regions (needs -fopenmp)
+# [15] TLS           requests over TLS read from OpenSSL's calls (--tls), from
+#                    the first ones after attaching to a busy server (needs
+#                    openssl)
 #
 # What all of a process's threads waited for a CPU is tested apart, in
 # tests/scenarios/cpu_wait.sh.
@@ -1700,6 +1703,53 @@ else
             && ok "omp: without --deep no request has a team ($(val spawn_n) that opened regions)" \
             || bad "omp-off: $(minus "$(val spawn_n)" "$(val spawn_count_under)") of $(val spawn_n) requests have team time without --deep"
     }
+fi
+}
+
+# --- [15] TLS ---------------------------------------------------------------------
+want 15 && {
+echo
+echo "[15] requests over TLS, read from OpenSSL's calls (--tls)"
+# A Python HTTPS server whose handler only sleeps 20 ms, already busy when the
+# agent attaches. Each sleep must be seen as one from the first requests on:
+# a TLS probe that starts requests before the scheduler hook is on takes
+# their whole time for time on a CPU.
+if ! command -v openssl >/dev/null; then
+    note "no openssl to make a certificate; skipped"
+elif ! openssl req -x509 -newkey rsa:2048 -nodes -keyout "$WORK/tls.key" -out "$WORK/tls.crt" \
+        -days 1 -subj /CN=localhost >/dev/null 2>&1; then
+    bad "tls: could not make a certificate"
+else
+    spawn python3 "$WORKLOADS/tls_http.py" server "$PORT" "$WORK/tls.crt" "$WORK/tls.key"
+    tls_server=${_TRACKED[-1]}
+    sleep 0.5
+    spawn python3 "$WORKLOADS/tls_http.py" load "$PORT" "$((DUR + 4))" 8
+    sleep 2
+    sudo -n "$BIN" slow --json --tls --above 0 --list 0 --interval 0 --pid "$tls_server" \
+        >"$WORK/tls.json" 2>"$WORK/tls.err" &
+    AGENT_JOB=$!
+    for _ in $(seq 100); do
+        grep -q '"type":"process"' "$WORK/tls.json" 2>/dev/null && break
+        sleep 0.1
+    done
+    sleep "$DUR"
+    stop_agent
+    stop_servers
+    run_checker TLS "$WORKLOADS/tls_check.py" "$WORK/tls.json"
+    tv() { echo "$TLS " | grep -oP "(?<=\b$1=)[0-9]+"; }
+    note "$TLS"
+    grep -q '"note":"TLS read from OpenSSL' "$WORK/tls.json" \
+        && ok "tls: the process's libssl is followed" \
+        || bad "tls: no TLS note for the server: $(grep '"type":"process"' "$WORK/tls.json" | head -1)"
+    (( $(tv calls) > 100 && $(tv tls) == $(tv calls) )) \
+        && ok "tls: requests read and flagged as over TLS ($(tv calls))" \
+        || bad "tls: $(tv calls) requests, $(tv tls) flagged as over TLS"
+    (( $(tv early) > 20 && $(tv asleep_short) == 0 )) \
+        && ok "tls: every handler's sleep seen as such, from the first second on ($(tv early) in it)" \
+        || bad "tls: $(tv asleep_short) requests with their sleep not seen, $(tv early) in the first second"
+    (( $(tv lost) == 0 )) \
+        && ok "tls: nothing lost" \
+        || bad "tls: lost: $(grep -o '"lost":{[^}]*}' "$WORK/tls.json" | tail -1)"
 fi
 }
 
