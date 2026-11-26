@@ -12,15 +12,15 @@ use std::path::Path;
 use super::elf::Elf;
 
 /// One line of `/proc/<pid>/maps` that maps a file.
-struct Mapping<'a> {
+pub(crate) struct Mapping<'a> {
     start: u64,
     end: u64,
     /// Where in the file `start` is.
     offset: u64,
-    path: &'a str,
+    pub(crate) path: &'a str,
 }
 
-fn mappings(maps: &str) -> impl Iterator<Item = Mapping<'_>> {
+pub(crate) fn mappings(maps: &str) -> impl Iterator<Item = Mapping<'_>> {
     maps.lines().filter_map(|line| {
         let mut fields = line.splitn(6, ' ');
         let (start, end) = fields.next()?.split_once('-')?;

@@ -220,12 +220,14 @@ struct thread_info {
 /* User registers saved at kernel entry. arm64 names them by number... */
 struct pt_regs {
 	u64 regs[31];
+	u64 sp;
 	u64 pc;
 };
 
 /* ... x86_64 by name. */
 struct pt_regs___x86 {
 	unsigned long r14;
+	unsigned long sp;
 	unsigned long ax;
 	unsigned long bx;
 	unsigned long cx;

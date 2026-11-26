@@ -21,6 +21,8 @@ static __always_inline u64 req_start(struct conn *c, struct carrier *cr, u64 now
 	req->first_tid = (u32)pid_tgid;
 	req->lport = c->lport;
 	req->rport = c->rport;
+	if (c->tls)
+		req->flags = REQ_F_TLS;
 	id = __sync_fetch_and_add(&req_next_id, 1) + 1;
 	if (bpf_map_update_elem(&REQ_TABLE, &id, req, BPF_NOEXIST)) {
 		bump(REQ_INSERT_FAILED);

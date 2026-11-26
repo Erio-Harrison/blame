@@ -250,6 +250,9 @@ pub const REQ_F_HANDLER_TIMED: u8 = 32;
 /// HTTP/1: the request had a `traceparent` header; its trace id is in
 /// [`RequestEvent::trace`].
 pub const REQ_F_TRACE: u8 = 64;
+/// The request came over TLS: its bytes were taken from the TLS library's
+/// calls (OpenSSL's `SSL_read` / `SSL_write`), not from the socket's.
+pub const REQ_F_TLS: u8 = 128;
 
 /// The request line did not fit in [`REQ_LINE_LEN`].
 pub const REQ_F_LINE_TRUNCATED: u8 = 1;
@@ -545,10 +548,16 @@ pub enum Counter {
     /// and what it read there did not hold together: the request's method
     /// and trace id, or its status, are not known from the process.
     H2ProcessUnread = 36,
+    /// Client connections whose bytes are taken from a TLS library's calls.
+    TlsFollowed = 37,
+    /// Calls of a TLS library whose socket is not known (its session was set
+    /// up before the probes were there, and no socket call has shown it
+    /// since): their bytes are not looked at.
+    TlsNoSocket = 38,
 }
 
 /// Number of slots in the counter array.
-pub const COUNTER_MAX: u32 = 37;
+pub const COUNTER_MAX: u32 = 39;
 
 impl Counter {
     pub const ALL: [Self; COUNTER_MAX as usize] = [
@@ -589,6 +598,8 @@ impl Counter {
         Self::OmpTeamIdleCpuNs,
         Self::ProcCpuInsertFailed,
         Self::H2ProcessUnread,
+        Self::TlsFollowed,
+        Self::TlsNoSocket,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -630,6 +641,8 @@ impl Counter {
             Self::OmpTeamIdleCpuNs => "omp_team_idle_cpu_ns",
             Self::ProcCpuInsertFailed => "proc_cpu_insert_failed",
             Self::H2ProcessUnread => "h2_process_unread",
+            Self::TlsFollowed => "tls_followed",
+            Self::TlsNoSocket => "tls_no_socket",
         }
     }
 
@@ -651,6 +664,7 @@ impl Counter {
             | Self::UnitCpuUnseenNs
             | Self::SpawnFollowed
             | Self::OmpTeamIdleCpuNs
+            | Self::TlsFollowed
             | Self::HelperLateNs => false,
             Self::RingbufFull
             | Self::FilenameTruncated
@@ -674,7 +688,8 @@ impl Counter {
             | Self::ReqH2Lost
             | Self::ReqStreamInsertFailed
             | Self::GrpcHandoffUnmatched
-            | Self::H2ProcessUnread => true,
+            | Self::H2ProcessUnread
+            | Self::TlsNoSocket => true,
         }
     }
 }

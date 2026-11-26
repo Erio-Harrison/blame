@@ -266,9 +266,42 @@ pub(super) fn follow_openmp_functions(attached: &Attached) {
     }
 }
 
+/// With `--tls`, in a process that has loaded a TLS library blame knows:
+/// probes where it hands over the plaintext of its connections, so that
+/// requests over TLS are read (`crate::tls`). All of them, or none.
+fn follow_tls(skel: &Skel, opt: &SlowOpt, pid: u32, found: &mut Inspected) -> Vec<Link> {
+    if !opt.tls {
+        return Vec::new();
+    }
+    match crate::tls::follow(skel, pid) {
+        Ok(None) => Vec::new(),
+        Ok(Some((tls, links))) => {
+            found.note = Some(match found.note.take() {
+                Some(note) => format!("{note}; {tls}"),
+                None => tls,
+            });
+            links
+        }
+        Err(err) => {
+            let text = format!("{err:#}");
+            eprintln!(
+                "blame: pid {pid}: TLS not read: {text}{}",
+                attach_hint(&text)
+            );
+            Vec::new()
+        }
+    }
+}
+
 /// Look at a process and attach what its attribution needs. If the probes
 /// cannot be attached, the process is attributed without them.
 pub(super) fn inspect_and_attach(skel: &Skel, opt: &SlowOpt, pid: u32) -> (Inspected, Vec<Link>) {
+    let (mut found, mut links) = inspect_and_attach_runtime(skel, opt, pid);
+    links.extend(follow_tls(skel, opt, pid, &mut found));
+    (found, links)
+}
+
+fn inspect_and_attach_runtime(skel: &Skel, opt: &SlowOpt, pid: u32) -> (Inspected, Vec<Link>) {
     let mut found = inspect(opt, pid);
     if found.probes.is_empty() {
         let links = follow_openmp(skel, opt, pid, &mut found);

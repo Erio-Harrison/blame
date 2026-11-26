@@ -3,9 +3,13 @@
 #ifndef BLAME_REQUEST_CALLS_H
 #define BLAME_REQUEST_CALLS_H
 
-/* What one call moved on a traced socket, handed to the protocol its connection speaks. */
+/*
+ * What one call moved on a traced socket, handed to the protocol its connection
+ * speaks. `tls`: the plaintext of a TLS library's call (tls/tls.h); on a
+ * TLS connection the socket calls' own bytes are ciphertext and are passed over.
+ */
 static __always_inline void on_data(struct sock *sk, struct carrier *cr, bool rx,
-				    struct call_data *d)
+				    struct call_data *d, bool tls)
 {
 	u64 key = (u64)sk;
 	u64 now = bpf_ktime_get_boot_ns();
@@ -16,6 +20,8 @@ static __always_inline void on_data(struct sock *sk, struct carrier *cr, bool rx
 		if (!c)
 			return;
 	}
+	if (c->tls != tls)
+		return;
 	settle_cpu(cr, now);
 	/* What was settled is the request's now: its unit's open stretch starts again here. */
 	unit_doing(cr, now, BIND_RUNNING);
@@ -143,6 +149,9 @@ static __always_inline int call_exit(struct trace_event_raw_sys_exit *ctx, u8 nr
 	sk = fd_to_sk((int)cr->sc_fd);
 	if (!sk)
 		return 0;
+	/* Inside a TLS library's call: the socket its session is on (tls/tls.h). */
+	if (cr->tls_fn)
+		cr->tls_sk = (u64)sk;
 
 	switch (nr) {
 	case NR_RECVFROM:
@@ -180,7 +189,7 @@ static __always_inline int call_exit(struct trace_event_raw_sys_exit *ctx, u8 nr
 		break;
 	}
 	d.total = ret;
-	on_data(sk, cr, nr <= NR_RECVMSG, &d);
+	on_data(sk, cr, nr <= NR_RECVMSG, &d, false);
 	return 0;
 }
 

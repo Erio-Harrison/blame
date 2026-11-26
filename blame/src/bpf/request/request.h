@@ -47,11 +47,13 @@
 #include "http1.h"
 #include "http2.h"
 #include "calls.h"
+#include "../tls/tls.h"
 #include "fsvc.h"
 #include "proc_cpu.h"
 #include "wake.h"
 
 /* Probes inside runtimes and libraries; they use everything above. */
+#include "../tls/openssl.h"
 #include "../runtime/go_grpc.h"
 #include "../runtime/go_spawn.h"
 #include "../runtime/go_park.h"

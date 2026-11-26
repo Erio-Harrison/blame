@@ -8,7 +8,7 @@
 
 use blame_common::{
     Counter, PARKED, REQ_F_ENDED_BY_CLOSE, REQ_F_HANDLER_TIMED, REQ_F_HTTP2, REQ_F_RESET_CLIENT,
-    REQ_F_RESET_SERVER, RequestEvent, UNIT_GOROUTINE, UNIT_THREAD, UNIT_TOKIO_TASK,
+    REQ_F_RESET_SERVER, REQ_F_TLS, RequestEvent, UNIT_GOROUTINE, UNIT_THREAD, UNIT_TOKIO_TASK,
 };
 use serde_json::{Value, json};
 
@@ -140,6 +140,7 @@ pub fn call(
         "start": rfc3339(i128::from(event.hdr.ts_boot_ns) + wall_offset),
         "duration_ns": latency,
         "protocol": if http2 { "http2" } else { "http1" },
+        "tls": event.flags & REQ_F_TLS != 0,
         "outcome": outcome,
         "service": service,
         "pid": event.hdr.pid,
@@ -398,6 +399,7 @@ pub fn fields() -> Value {
                 "start": "When the server read the request's first byte (UTC).",
                 "duration_ns": "Start to end.",
                 "protocol": "`http1` or `http2` (gRPC is http2).",
+                "tls": "Whether the call came over TLS, read from the TLS library's calls (with `--tls`).",
                 "outcome": "`answered`; `reset_by_client` (cancelled, or past its deadline); `reset_by_server` (refused, or the server enforced the deadline); `ended_by_close` (HTTP/1 response without a length).",
                 "service": "The systemd unit, container or pod the process runs in; null if not known.",
                 "pid": "The server process.",

@@ -34,35 +34,6 @@
 #ifndef BLAME_RUNTIME_TOKIO_TASKS_H
 #define BLAME_RUNTIME_TOKIO_TASKS_H
 
-/* The n-th argument (0 to 3) of a function following the C register order. */
-static __always_inline u64 c_arg(struct pt_regs *regs, int n)
-{
-	struct pt_regs___x86 *x86 = (struct pt_regs___x86 *)regs;
-
-	if (bpf_core_field_exists(regs->regs)) {
-		switch (n) {
-		case 0:
-			return BPF_CORE_READ(regs, regs[0]);
-		case 1:
-			return BPF_CORE_READ(regs, regs[1]);
-		case 2:
-			return BPF_CORE_READ(regs, regs[2]);
-		default:
-			return BPF_CORE_READ(regs, regs[3]);
-		}
-	}
-	switch (n) {
-	case 0:
-		return BPF_CORE_READ(x86, di);
-	case 1:
-		return BPF_CORE_READ(x86, si);
-	case 2:
-		return BPF_CORE_READ(x86, dx);
-	default:
-		return BPF_CORE_READ(x86, cx);
-	}
-}
-
 static __always_inline u64 tokio_header_id(u64 header, u64 *vtable)
 {
 	u64 vt = header ? user_u64(header + 16) : 0;

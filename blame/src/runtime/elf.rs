@@ -3,7 +3,7 @@
 //! file.
 
 /// The little of a 64-bit little-endian ELF file that is needed here.
-pub(super) struct Elf<'a> {
+pub(crate) struct Elf<'a> {
     pub image: &'a [u8],
     sections: Vec<Section<'a>>,
     /// Loaded segments: (address, offset in the file, bytes in the file).
@@ -19,7 +19,7 @@ struct Section<'a> {
     data: &'a [u8],
 }
 
-pub(super) struct TlsSegment {
+pub(crate) struct TlsSegment {
     pub size: u64,
     pub align: u64,
 }

@@ -22,6 +22,7 @@ mod runq;
 mod runtime;
 mod slow;
 mod stats;
+mod tls;
 mod top;
 
 use std::{path::PathBuf, sync::Arc};

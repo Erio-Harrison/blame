@@ -124,6 +124,12 @@ struct conn {
 	struct h2_dir h2tx;
 	u32 h2_max_sid;
 	u32 h2_open;
+	/*
+	 * Client socket: TLS, its bytes taken from the TLS library's calls
+	 * (tls/tls.h), not from the socket calls, which carry ciphertext.
+	 */
+	u8 tls;
+	u8 _pad_tls[7];
 	char rx_line[REQ_LINE_LEN];
 };
 
@@ -315,6 +321,19 @@ struct carrier {
 	/* Those above are set: it is waiting, and was seen to start. */
 	u8 rq_snap;
 	u8 _pad4[3];
+	/*
+	 * The TLS library call in flight (tls/tls.h); tls_fn 0 = none: the
+	 * session, the caller's buffer, where the _ex forms write the length,
+	 * the socket a socket call made inside it went to, and the stack
+	 * pointer at its entry.
+	 */
+	u64 tls_ssl;
+	u64 tls_buf;
+	u64 tls_outp;
+	u64 tls_sk;
+	u64 tls_sp;
+	u8 tls_fn;
+	u8 _pad6[7];
 };
 
 /*

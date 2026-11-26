@@ -108,6 +108,15 @@ pub struct SlowOpt {
     /// of a team that take up a request's work, shown the same way.
     #[clap(long, alias = "spawned", conflicts_with = "threads_only")]
     deep: bool,
+    /// Read the requests of TLS connections (HTTPS) from the TLS library
+    /// where it hands the plaintext over: OpenSSL's libssl (`SSL_read`,
+    /// `SSL_write` and their `_ex` forms, `SSL_sendfile`), in each traced
+    /// process that has loaded it. Each of those calls then costs a trap into
+    /// the kernel: on light requests over TLS that is a large share of
+    /// throughput (measured: some 40-50% for a 100-byte response at 60k
+    /// requests/s), so it is off unless asked for.
+    #[clap(long)]
+    tls: bool,
 }
 
 /// How often processes the kernel side found by itself are looked at. Until

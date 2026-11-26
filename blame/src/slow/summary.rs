@@ -154,6 +154,14 @@ pub(super) fn kernel_line(counters: &Counters) -> String {
             render_counter(counters, Counter::OmpTeamIdleCpuNs)
         );
     }
+    // Only where TLS connections are read from their library (`--tls`).
+    if counters.get(Counter::TlsFollowed) > 0 || counters.get(Counter::TlsNoSocket) > 0 {
+        line += &format!(
+            "  {}  {}",
+            render_counter(counters, Counter::TlsFollowed),
+            render_counter(counters, Counter::TlsNoSocket)
+        );
+    }
     line
 }
 

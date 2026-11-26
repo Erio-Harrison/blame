@@ -221,6 +221,8 @@ enum attr_source {
 #define REQ_F_HANDLER_TIMED 32
 /* HTTP/1: the request had a traceparent header; request_event.trace holds its trace id. */
 #define REQ_F_TRACE 64
+/* The request came over TLS: its bytes were taken from the TLS library's calls. */
+#define REQ_F_TLS 128
 
 /*
  * One finished request: from the first byte of the request read on a
@@ -506,7 +508,15 @@ enum counter {
 	 * process. The process's layout is not the one these probes know.
 	 */
 	H2_PROCESS_UNREAD = 36,
-	COUNTER_MAX = 37,
+	/* Client connections whose bytes are taken from a TLS library's calls. */
+	TLS_FOLLOWED = 37,
+	/*
+	 * Calls of a TLS library whose socket is not known (its session was set
+	 * up before the probes were there, and no socket call has shown it
+	 * since): their bytes are not looked at.
+	 */
+	TLS_NO_SOCKET = 38,
+	COUNTER_MAX = 39,
 };
 
 struct runq_hist {

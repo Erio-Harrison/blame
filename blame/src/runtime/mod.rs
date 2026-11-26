@@ -11,7 +11,7 @@
 //! probed of the libraries that run on it (grpc-go in `go.rs`; hyper and h2
 //! in `tokio.rs` and `tasks.rs`), as `bpf/runtime/` does on the kernel side.
 
-mod elf;
+pub(crate) mod elf;
 mod go;
 pub mod omp;
 pub mod tasks;
