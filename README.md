@@ -96,7 +96,19 @@ NAS, SMB, virtiofs) are shown as `fileservice`, apart from the local disk;
 the part of it spent waiting for a lock another thread held, mostly another
 request writing or flushing the same file, is shown with it
 (`fileservice=76ms(lock=72ms)`).
-Not covered yet: encrypted connections (TLS), io_uring, a time breakdown for
+With `--tls`, HTTPS requests are read where OpenSSL's libssl, loaded as a
+shared library, hands their plaintext over (`SSL_read`, `SSL_write` and their
+`_ex` forms), and broken down the same way: on a C++ server with a thread per
+connection, against its own figures, within 3% for each part, on connections
+opened before blame as after. Each of those calls then costs a trap into the
+kernel, some 40-50% of throughput on light requests, so it is off unless
+asked for. What it does not read: TLS libraries other than OpenSSL (Go's
+`crypto/tls`, rustls, Java's own), a TLS library linked into the program
+instead of loaded (the BoringSSL that gRPC's CMake build and the `grpcio`
+wheels bring), and OpenSSL used over buffers in memory rather than the
+socket: gRPC's C++ core, also when built on the system's libssl, and Python's
+asyncio, whose calls are counted as `tls_no_socket`.
+Not covered yet: TLS other than the above, io_uring, a time breakdown for
 HTTP/2 servers other than grpc-go and tonic (they get latency, method, status
 and trace id), runtimes other than Go and tokio (they are seen thread by
 thread), and x86_64 (written, not run).
