@@ -1864,6 +1864,43 @@ else
     isnum "$opened" && (( opened > 4 && ${unread:-0} == opened && calls == 0 )) \
         && ok "tls: without --tls, every connection over TLS is counted as unread ($unread of $opened), no request made up" \
         || bad "tls: without --tls: tls_unread=${unread:-none} of ${opened:-?} connections, $calls requests"
+
+    # Kernel TLS: from the handshake on, the socket calls carry plaintext,
+    # each direction once its keys are in, and the handshake's Finished and
+    # session ticket pass through them as records of their own. Every request
+    # must be read from them, the first of each connection too, without --tls.
+    tls_rx() { grep -oP '(?<=^TlsRxSw)\s+[0-9]+' /proc/net/tls_stat 2>/dev/null | tr -d ' \t'; }
+    if [[ ! -r /proc/net/tls_stat ]] && ! sudo -n modprobe tls 2>/dev/null; then
+        note "tls: no kernel TLS (tls module); kernel TLS case skipped"
+    else
+        KTLS=1 spawn python3 "$WORKLOADS/tls_http.py" server "$PORT" "$WORK/tls.crt" "$WORK/tls.key"
+        tls_server=${_TRACKED[-1]}
+        sleep 0.5
+        sudo -n "$BIN" slow --json --above 0 --list 0 --interval 0 --pid "$tls_server" \
+            >"$WORK/ktls.json" 2>"$WORK/ktls.err" &
+        AGENT_JOB=$!
+        for _ in $(seq 100); do
+            grep -q '"type":"process"' "$WORK/ktls.json" 2>/dev/null && break
+            sleep 0.1
+        done
+        rx0=$(tls_rx)
+        out=$(python3 "$WORKLOADS/tls_http.py" load "$PORT" 2 4)
+        rx1=$(tls_rx)
+        sleep 0.5
+        stop_agent
+        stop_servers
+        opened=$(echo "$out" | grep -oP '(?<=connections=)[0-9]+')
+        answered=$(echo "$out" | grep -oP '(?<=requests=)[0-9]+')
+        calls=$(grep -c '"type":"call"' "$WORK/ktls.json")
+        lost=$(grep '"scope":"total"' "$WORK/ktls.json" | grep -o '"lost":{[^}]*}' | tail -1)
+        if ! isnum "$rx0" || ! isnum "$rx1" || (( rx1 - rx0 < opened )); then
+            note "tls: the kernel took up ${rx1:-?}-${rx0:-?} of ${opened:-?} connections; kernel TLS case skipped"
+        else
+            isnum "$answered" && (( opened > 4 && calls == answered )) && [[ $lost == '"lost":{}' ]] \
+                && ok "tls: over kernel TLS every request is read from the socket calls ($calls of $answered, $opened connections), nothing lost" \
+                || bad "tls: over kernel TLS $calls of ${answered:-?} requests seen (${opened:-?} connections), $lost"
+        fi
+    fi
 fi
 }
 

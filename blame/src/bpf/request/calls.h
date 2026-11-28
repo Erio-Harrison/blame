@@ -51,7 +51,8 @@ static __always_inline void on_data(struct sock *sk, struct carrier *cr, bool rx
 	}
 	if (!tls && rx && tls_hello(sk, c, cr, d))
 		return;
-	if (c->tls != tls)
+	/* Ciphertext is not looked at: a TLS connection's socket calls only in directions kernel TLS has the keys of. */
+	if (c->tls != tls && !(c->tls == 2 && !tls && (c->ktls & (rx ? KTLS_RX : KTLS_TX))))
 		return;
 	settle_cpu(cr, now);
 	/* What was settled is the request's now: its unit's open stretch starts again here. */
@@ -210,6 +211,31 @@ static __always_inline bool rs_tx_take(struct carrier *cr, u64 sk, struct call_d
 	return true;
 }
 
+/*
+ * A sendmsg or recvmsg of a record kernel TLS says is not application data
+ * (its first cmsg: the record's type): the handshake's Finished, read and
+ * sent after the keys were handed over, or a session ticket. Not HTTP.
+ * Kernel TLS never puts records of two types in one call.
+ */
+static __noinline bool ktls_not_data(u64 control, u64 len)
+{
+	struct {
+		u64 len;
+		s32 level;
+		s32 type;
+		u8 data;
+	} cm = {};
+
+	/* A cmsg header (16 bytes) and the one byte of the type. */
+	if (!control || len < 17)
+		return false;
+	if (bpf_probe_read_user(&cm, 17, (void *)control))
+		return false;
+	return cm.level == SOL_TLS &&
+	       (cm.type == TLS_SET_RECORD_TYPE || cm.type == TLS_GET_RECORD_TYPE) &&
+	       cm.data != TLS_APPLICATION_DATA;
+}
+
 static __always_inline int call_exit(struct trace_event_raw_sys_exit *ctx, u8 nr)
 {
 	struct carrier *cr = carrier_of_current(false);
@@ -273,6 +299,8 @@ static __always_inline int call_exit(struct trace_event_raw_sys_exit *ctx, u8 nr
 
 		if (bpf_probe_read_user(&msg, sizeof(msg), (void *)cr->sc_a1))
 			return 0;
+		if (ktls_not_data((u64)msg.msg_control, msg.msg_controllen))
+			return 0;
 		call_iovecs(&d, (u64)msg.msg_iov, msg.msg_iovlen, ret);
 		break;
 	}
@@ -289,10 +317,14 @@ static __always_inline int call_exit(struct trace_event_raw_sys_exit *ctx, u8 nr
 }
 
 /*
- * Kernel TLS taking up a client connection's reading (setsockopt(SOL_TLS,
- * TLS_RX), once the handshake is done): from here its socket calls carry
- * plaintext. One left to a TLS library at its handshake (conn.tls 2) is
- * given back to them, and is not unread after all (TLS_KERNEL).
+ * Kernel TLS taking up a direction of a client connection
+ * (setsockopt(SOL_TLS, TLS_RX or TLS_TX), during the handshake): from here
+ * the socket calls of that direction carry plaintext. The two are handed
+ * over apart (OpenSSL: the receiving keys before the client's Finished is
+ * read, the sending ones after the session ticket went out as ciphertext),
+ * so a connection left to a TLS library at its handshake (conn.tls 2) is
+ * given back to its socket calls direction by direction. With its reading
+ * it is not unread after all (TLS_KERNEL).
  */
 SEC("tracepoint/syscalls/sys_enter_setsockopt")
 int req_enter_setsockopt(struct trace_event_raw_sys_enter *ctx)
@@ -301,7 +333,8 @@ int req_enter_setsockopt(struct trace_event_raw_sys_enter *ctx)
 	struct sock *sk;
 	u64 key;
 
-	if (ctx->args[1] != SOL_TLS || ctx->args[2] != TLS_RX || !traced(cur_pid_tgid() >> 32))
+	if (ctx->args[1] != SOL_TLS || (ctx->args[2] != TLS_RX && ctx->args[2] != TLS_TX) ||
+	    !traced(cur_pid_tgid() >> 32))
 		return 0;
 	sk = fd_to_sk((int)ctx->args[0]);
 	if (!sk)
@@ -310,7 +343,11 @@ int req_enter_setsockopt(struct trace_event_raw_sys_enter *ctx)
 	c = bpf_map_lookup_elem(&REQ_CONNS, &key);
 	if (!c || c->tls != 2)
 		return 0;
-	c->tls = 0;
+	if (ctx->args[2] == TLS_TX) {
+		c->ktls |= KTLS_TX;
+		return 0;
+	}
+	c->ktls |= KTLS_RX;
 	if (c->tls_hello == 2) {
 		c->tls_hello = 1;
 		bump(TLS_KERNEL);

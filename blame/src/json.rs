@@ -399,7 +399,7 @@ pub fn fields() -> Value {
                 "start": "When the server read the request's first byte (UTC).",
                 "duration_ns": "Start to end.",
                 "protocol": "`http1` or `http2` (gRPC is http2).",
-                "tls": "Whether the call came over TLS, read from the TLS library's calls (with `--tls`).",
+                "tls": "Whether the call came over TLS: read from the TLS library's calls (with `--tls`), or from its socket's where kernel TLS decrypted it.",
                 "outcome": "`answered`; `reset_by_client` (cancelled, or past its deadline); `reset_by_server` (refused, or the server enforced the deadline); `ended_by_close` (HTTP/1 response without a length).",
                 "service": "The systemd unit, container or pod the process runs in; null if not known.",
                 "pid": "The server process.",

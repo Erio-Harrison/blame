@@ -2,16 +2,20 @@
 """An HTTPS server and its load, over Python's ssl module (OpenSSL's libssl,
 sessions placed by SSL_set_fd), for `blame slow --tls`.
 
-    tls_http.py server PORT CERT KEY       GET /sleep: sleeps 20 ms, answers "ok"
+    tls_http.py server PORT CERT KEY       GET /sleep: sleeps 20 ms, answers "ok";
+                                           with KTLS=1, kernel TLS (TLS 1.2,
+                                           AES-GCM: both ways on OpenSSL 3.0)
     tls_http.py load PORT SECONDS CONNS    each connection keeps alive for 20
                                            requests, then a new one is opened;
                                            prints `connections=N` it opened
+                                           and `requests=N` answered
 
 The handler's time is all asleep: a request blame reports with its time on a
 CPU is one whose thread's sleeps it did not see.
 """
 import http.client
 import http.server
+import os
 import socketserver
 import ssl
 import sys
@@ -41,6 +45,10 @@ class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
 def server(port, cert, key):
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.load_cert_chain(cert, key)
+    if os.environ.get("KTLS"):
+        ctx.options |= ssl.OP_ENABLE_KTLS
+        ctx.maximum_version = ssl.TLSVersion.TLSv1_2
+        ctx.set_ciphers("ECDHE-RSA-AES128-GCM-SHA256")
     srv = Server(("127.0.0.1", port), Handler)
     srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
     srv.serve_forever()
@@ -51,7 +59,7 @@ def load(port, seconds, conns):
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
     end = time.monotonic() + seconds
-    opened = []
+    opened, answered = [], []
 
     def one():
         while time.monotonic() < end:
@@ -63,6 +71,7 @@ def load(port, seconds, conns):
                         break
                     c.request("GET", "/sleep")
                     c.getresponse().read()
+                    answered.append(1)
             except OSError:
                 time.sleep(0.05)
             finally:
@@ -73,7 +82,7 @@ def load(port, seconds, conns):
         t.start()
     for t in threads:
         t.join()
-    print(f"connections={len(opened)}")
+    print(f"connections={len(opened)} requests={len(answered)}")
 
 
 if __name__ == "__main__":

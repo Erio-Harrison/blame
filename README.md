@@ -113,8 +113,8 @@ gRPC calls and 25-30% for HTTP/1.1 on top of what the agent costs without
 it, and 40-50% with OpenSSL at 60k requests/s, so it is off unless asked
 for. Without it, client connections that begin with a TLS handshake are
 counted as `tls_unread`, so that requests not seen for that are not silent;
-those that kernel TLS takes up after the handshake are read from their
-socket calls instead (the first request of each is lost). What it does not
+those that kernel TLS takes up during the handshake are read from their
+socket calls instead. What it does not
 read: other TLS libraries (Java's own, rustls before 0.23), Go on x86-64, a
 TLS library linked into the program but Go's and rustls (the BoringSSL that
 gRPC's CMake build and the `grpcio` wheels bring), and OpenSSL used over

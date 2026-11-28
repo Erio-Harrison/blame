@@ -175,7 +175,14 @@ struct proc_cfg {
 #define PROC_F_TLS_READ 32
 /* setsockopt: kernel TLS's level, and its option that takes up reading. */
 #define SOL_TLS 282
+#define TLS_TX 1
 #define TLS_RX 2
+/* The cmsg of a kernel TLS record's type (TLS_SET_RECORD_TYPE on send, TLS_GET_ on receive). */
+#define TLS_SET_RECORD_TYPE 1
+#define TLS_GET_RECORD_TYPE 2
+#define TLS_APPLICATION_DATA 23
+#define KTLS_RX 1
+#define KTLS_TX 2
 /*
  * Go's crypto/tls is read: its calls in flight are kept by goroutine
  * (GO_TLS_CALLS), and a socket call made inside one shows its connection.

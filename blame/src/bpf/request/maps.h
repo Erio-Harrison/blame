@@ -131,7 +131,13 @@ struct conn {
 	u8 tls;
 	/* Its first bytes were looked at for a TLS handshake (TLS_UNREAD). */
 	u8 tls_hello;
-	u8 _pad_tls[6];
+	/*
+	 * Kernel TLS has the keys of these directions (KTLS_RX, KTLS_TX): on a
+	 * connection left to a TLS library at its handshake (tls 2), their
+	 * socket calls carry plaintext from then on.
+	 */
+	u8 ktls;
+	u8 _pad_tls[5];
 	char rx_line[REQ_LINE_LEN];
 };
 
