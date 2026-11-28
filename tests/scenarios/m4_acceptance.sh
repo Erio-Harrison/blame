@@ -591,11 +591,11 @@ start_agent "$WORK/tr.log" --pid "$SERVER_PID" && {
     stop_servers
     TR=$(python3 "$WORKLOADS/http_trace.py" check "$WORK/tr.expected" "$WORK/tr.log")
     note "$TR"
-    tr() { echo "$TR" | grep -oP "(?<=\b$1=)[0-9]+"; }
-    (( $(tr expected) > 100 && $(tr unreported) == 0 && $(tr right) == $(tr with_id) && $(tr wrong) == 0 )) \
-        && ok "HTTP/1.1: every request's trace id is reported, however its headers arrived ($(tr right) of $(tr with_id))" \
+    trace_n() { echo "$TR" | grep -oP "(?<=\b$1=)[0-9]+"; }
+    (( $(trace_n expected) > 100 && $(trace_n unreported) == 0 && $(trace_n right) == $(trace_n with_id) && $(trace_n wrong) == 0 )) \
+        && ok "HTTP/1.1: every request's trace id is reported, however its headers arrived ($(trace_n right) of $(trace_n with_id))" \
         || bad "HTTP/1.1 trace ids: $TR"
-    (( $(tr unexpected) == 0 && $(tr missing) == 0 )) \
+    (( $(trace_n unexpected) == 0 && $(trace_n missing) == 0 )) \
         && ok "HTTP/1.1: none for requests without one or with a value that is not one" \
         || bad "HTTP/1.1 trace ids: $TR"
 }
@@ -1171,14 +1171,29 @@ grpc_late() {
     sleep 1
     start_agent "$WORK/g_$name.log" --pid "$SERVER_PID" || { wait "$load"; return 1; }
     # When the agent was seen to say it is attached: no earlier than it was.
-    local attached
+    local attached found
     attached=$(python3 -c 'import time; print(time.clock_gettime_ns(time.CLOCK_BOOTTIME))')
+    # When the agent was seen to say where tasks keep the stream id (tonic),
+    # no earlier than it did: looked for every 5 ms while the load runs.
+    python3 - "$WORK/g_$name.log" "$load" >"$WORK/g_$name.found" <<'PY' &
+import os, sys, time
+log, load = sys.argv[1], int(sys.argv[2])
+while os.path.exists(f"/proc/{load}"):
+    with open(log, errors="replace") as f:
+        if "stream handlers found" in f.read():
+            print(time.clock_gettime_ns(time.CLOCK_BOOTTIME))
+            break
+    time.sleep(0.005)
+PY
+    local finder=$!
     wait "$load"
+    wait "$finder"
+    found=$(cat "$WORK/g_$name.found")
     stop_agent
     stop_servers
-    export GRPC_ATTACHED_NS=$attached
+    export GRPC_ATTACHED_NS=$attached GRPC_FOUND_NS=${found:-0}
     run_checker GRPC "$WORKLOADS/grpc_check.py" "$WORK/g_$name.srv" "$WORK/g_$name.log" "$WORK/g_$name.cli"
-    unset GRPC_ATTACHED_NS
+    unset GRPC_ATTACHED_NS GRPC_FOUND_NS
     note "$GRPC"
 }
 
@@ -1366,9 +1381,18 @@ if [[ -n "${GO_CMD:=${GO:-$(command -v go || true)}}" ]] \
             (( $(gval late_calls) > 1000 && $(gval late_no_trace) == 0 && $(gval trace_wrong) == 0 )) \
                 && ok "$1: every call begun after attaching has its trace id ($(gval late_calls); of all $(gval with_trace) of $(gval reported)), none a wrong one" \
                 || bad "$1: late_calls=$(gval late_calls) late_no_trace=$(gval late_no_trace) trace_wrong=$(gval trace_wrong)"
-            (( $(gval statuses) * 100 >= $(gval answered) * 97 && $(gval statuses) == $(gval status_ok) )) \
-                && ok "$1: nearly all answered calls have their status ($(gval statuses) of $(gval answered)), all the server's" \
-                || bad "$1: statuses=$(gval statuses) status_ok=$(gval status_ok) answered=$(gval answered)"
+            # Calls read before the agent knew where tasks keep the stream id
+            # have no status (nor time): counted apart, the rest held to 97%.
+            (( $(gval answered_after) > 1000 && $(gval statuses_after) * 100 >= $(gval answered_after) * 97 \
+                && $(gval statuses) == $(gval status_ok) )) \
+                && ok "$1: nearly all answered calls have their status ($(gval statuses_after) of $(gval answered_after); $(gval before_found) read before the stream id was placed), all the server's" \
+                || bad "$1: statuses_after=$(gval statuses_after) answered_after=$(gval answered_after) before_found=$(gval before_found) statuses=$(gval statuses) status_ok=$(gval status_ok)"
+            # The agent is woken by the first samples of tasks, not left to
+            # its next drain (up to 200 ms, some 200 calls here): it takes
+            # the few calls that show where the id is (5-11 seen).
+            (( $(gval found_wait) <= 50 )) \
+                && ok "$1: the stream id is placed within the first calls after attaching ($(gval found_wait) before it)" \
+                || bad "$1: $(gval found_wait) answered calls read after attaching and before the stream id was placed"
             # The status is read in the task that serves the call, as its
             # time is: a call has both or neither.
             (( $(gval status_untimed) == 0 && $(gval timed_no_status) == 0 )) \
@@ -1870,10 +1894,23 @@ else
     # session ticket pass through them as records of their own. Every request
     # must be read from them, the first of each connection too, without --tls.
     tls_rx() { grep -oP '(?<=^TlsRxSw)\s+[0-9]+' /proc/net/tls_stat 2>/dev/null | tr -d ' \t'; }
-    if [[ ! -r /proc/net/tls_stat ]] && ! sudo -n modprobe tls 2>/dev/null; then
-        note "tls: no kernel TLS (tls module); kernel TLS case skipped"
+    # Why a reading of the counter is missing, for the note when it is.
+    tls_stat_state() {
+        if [[ ! -e /proc/net/tls_stat ]]; then echo "/proc/net/tls_stat absent"
+        elif [[ ! -r /proc/net/tls_stat ]]; then echo "/proc/net/tls_stat unreadable"
+        else echo "TlsRxSw line: '$(grep '^TlsRxSw' /proc/net/tls_stat 2>&1 | tr -s ' \t' ' ')'"; fi
+    }
+    tls_mod="tls module loaded before"
+    if [[ ! -r /proc/net/tls_stat ]]; then
+        tls_mod="modprobe tls: $(sudo -n modprobe tls 2>&1; echo "exit $?")"
+    fi
+    if [[ ! -r /proc/net/tls_stat ]]; then
+        note "tls: no kernel TLS ($tls_mod; $(tls_stat_state)); kernel TLS case skipped"
     else
-        KTLS=1 spawn python3 "$WORKLOADS/tls_http.py" server "$PORT" "$WORK/tls.crt" "$WORK/tls.key"
+        # As spawn, but its errors kept for the note below.
+        KTLS=1 python3 "$WORKLOADS/tls_http.py" server "$PORT" "$WORK/tls.crt" "$WORK/tls.key" \
+            >/dev/null 2>"$WORK/ktls_server.err" &
+        _TRACKED+=("$!")
         tls_server=${_TRACKED[-1]}
         sleep 0.5
         sudo -n "$BIN" slow --json --above 0 --list 0 --interval 0 --pid "$tls_server" \
@@ -1884,8 +1921,10 @@ else
             sleep 0.1
         done
         rx0=$(tls_rx)
+        isnum "$rx0" || rx0_state=$(tls_stat_state)
         out=$(python3 "$WORKLOADS/tls_http.py" load "$PORT" 2 4)
         rx1=$(tls_rx)
+        isnum "$rx1" || rx1_state=$(tls_stat_state)
         sleep 0.5
         stop_agent
         stop_servers
@@ -1894,7 +1933,7 @@ else
         calls=$(grep -c '"type":"call"' "$WORK/ktls.json")
         lost=$(grep '"scope":"total"' "$WORK/ktls.json" | grep -o '"lost":{[^}]*}' | tail -1)
         if ! isnum "$rx0" || ! isnum "$rx1" || (( rx1 - rx0 < opened )); then
-            note "tls: the kernel took up ${rx1:-?}-${rx0:-?} of ${opened:-?} connections; kernel TLS case skipped"
+            note "tls: the kernel took up ${rx1:-?}-${rx0:-?} of ${opened:-?} connections ($tls_mod; before: ${rx0_state:-read}; after: ${rx1_state:-read}; server: $(tail -c 300 "$WORK/ktls_server.err" 2>/dev/null | tr '\n' ' ')); kernel TLS case skipped"
         else
             isnum "$answered" && (( opened > 4 && calls == answered )) && [[ $lost == '"lost":{}' ]] \
                 && ok "tls: over kernel TLS every request is read from the socket calls ($calls of $answered, $opened connections), nothing lost" \

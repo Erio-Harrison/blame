@@ -61,6 +61,14 @@ server's, and its CPU plus run-queue time not below, by more than 100 us or
                 it say so, so no earlier than it was); 0 without it
   late_no_trace of those, reported without a trace id: probes in the process
                 were on when their headers were read, so there should be none
+  before_found  answered calls whose headers the server read before the agent
+                said where tasks keep the stream id (GRPC_FOUND_NS, CLOCK_BOOTTIME
+                ns, when the test saw it say so; tonic): their handlers cannot
+                be followed, so they have no time and no status; 0 without it
+  found_wait    of those, read after the agent was attached: what it took to
+                place the stream id
+  answered_after, statuses_after   the other answered calls, and of those, the
+                ones reported with a status
   timeout_ok    of those, reported with the right path as over within 80 ms of
                 the server reading them (the client's deadline is 20 ms):
                 reset by the client, or by the server, which is told the
@@ -164,6 +172,8 @@ def main():
     timeouts = timeout_ok = 0
     attached = int(os.environ.get("GRPC_ATTACHED_NS", "0"))
     late_calls = late_no_trace = 0
+    found = int(os.environ.get("GRPC_FOUND_NS", "0"))
+    before_found = found_wait = answered_after = statuses_after = 0
     for trace, path in given_up.items():
         k = by_trace.get(trace)
         if k is None:
@@ -198,6 +208,14 @@ def main():
         if k["grpc_status"] >= 0:
             statuses += 1
             status_ok += k["grpc_status"] == status
+        # Its headers read before the agent said where tasks keep the
+        # stream id: its handler could not be followed yet.
+        if found and read_at.get(trace, t0) < found:
+            before_found += 1
+            found_wait += read_at.get(trace, t0) >= attached
+        else:
+            answered_after += 1
+            statuses_after += k["grpc_status"] >= 0
         status_untimed += k["grpc_status"] >= 0 and k["observed_ns"] == 0
         timed_no_status += k["grpc_status"] < 0 and k["observed_ns"] > 0
         if k["observed_ns"] == 0:
@@ -261,6 +279,7 @@ def main():
         f" lead_p50_us={pctl(leads, 50) // 1000} lead_p99_us={pctl(leads, 99) // 1000}"
         f" unnamed_followed={unnamed_followed} timed={timed} resets={resets}"
         f" timeouts={timeouts} timeout_ok={timeout_ok} late_calls={late_calls} late_no_trace={late_no_trace}"
+        f" before_found={before_found} found_wait={found_wait} answered_after={answered_after} statuses_after={statuses_after}"
         f" m_paths={len(methods)} m_calls_ok={m_calls_ok} m_ends_ok={m_ends_ok} m_listed_ok={m_listed_ok}"
     )
 
