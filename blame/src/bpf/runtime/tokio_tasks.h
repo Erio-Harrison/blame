@@ -176,7 +176,14 @@ int up_tokio_spawn(struct pt_regs *ctx)
 		e->parent = cr->unit.id;
 		e->child = child;
 		e->vtable = kind.vtable;
-		if (bpf_ringbuf_output(&EVENTS, e, sizeof(*e), 0))
+		/*
+		 * The agent is woken at once: until it says where the id is, the
+		 * streams of this kind of task go without their time and status,
+		 * and records before this one that did not wake it (requests,
+		 * headers) would leave it to the next drain, up to 200 ms on. Sent
+		 * only until a verdict, so the wakeups end.
+		 */
+		if (bpf_ringbuf_output(&EVENTS, e, sizeof(*e), BPF_RB_FORCE_WAKEUP))
 			bump(RINGBUF_FULL);
 		return 0;
 	}
