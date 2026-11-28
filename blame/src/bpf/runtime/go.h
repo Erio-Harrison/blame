@@ -15,7 +15,9 @@
 /*
  * The id of the goroutine `task` is running; 0 = none; GO_GOID_UNKNOWN when
  * it cannot be told, which is not "none": C code may use the register for
- * something else for a while (the vDSO's clock functions do), and the
+ * something else for a while (the vDSO's clock functions do, and in a
+ * program linked with libc so does pthread_create, by which Go's runtime
+ * makes its threads there, and a new thread's start in libc), and the
  * goroutine goes on afterwards. `task` must be current.
  */
 /*

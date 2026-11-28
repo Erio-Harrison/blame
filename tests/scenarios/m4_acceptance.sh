@@ -84,7 +84,19 @@ cc -O2 -Wall -pthread -fopenmp -o "$WORK/http_truth" "$SCN_DIR/../tools/http_tru
     HAVE_OMP=
     cc -O2 -Wall -pthread -o "$WORK/http_truth" "$SCN_DIR/../tools/http_truth.c" || exit 1
 }
-cc -O2 -Wall -pthread -o "$WORK/http_load" "$SCN_DIR/../tools/http_load.c" || exit 1
+# HTTPS too where OpenSSL is there to build it with (HTTP_LOAD_TLS=1).
+if cc -O2 -Wall -pthread -DWITH_TLS -o "$WORK/http_load" "$SCN_DIR/../tools/http_load.c" -lssl -lcrypto 2>/dev/null \
+    && openssl req -x509 -newkey rsa:2048 -nodes -keyout "$WORK/tls.key" -out "$WORK/tls.crt" \
+        -days 1 -subj /CN=localhost >/dev/null 2>&1; then
+    HAVE_TLS=1
+else
+    HAVE_TLS=""
+    cc -O2 -Wall -pthread -o "$WORK/http_load" "$SCN_DIR/../tools/http_load.c" || exit 1
+fi
+# The cases over TLS: the servers and loads take these from the environment,
+# the agent reads TLS (--tls).
+tls_on() { export TLS_CERT="$WORK/tls.crt" TLS_KEY="$WORK/tls.key" HTTP_LOAD_TLS=1 GRPC_TLS=1 AGENT_EXTRA=--tls; }
+tls_off() { unset TLS_CERT TLS_KEY HTTP_LOAD_TLS GRPC_TLS AGENT_EXTRA; }
 
 # --- thresholds ---------------------------------------------------------------
 # Pairs must have both ends within 300 us of the server's own clock. The dev VM
@@ -128,7 +140,8 @@ start_server() {
 start_agent() {
     local log=$1
     shift
-    sudo -n "$BIN" slow --raw --above 0 --interval 0 "$@" >"$log" 2>&1 &
+    # shellcheck disable=SC2086 # AGENT_EXTRA: options for every agent of a case, split.
+    sudo -n "$BIN" slow --raw --above 0 --interval 0 "$@" ${AGENT_EXTRA:-} >"$log" 2>&1 &
     AGENT_JOB=$!
     for _ in $(seq 100); do
         grep -q 'slow attached' "$log" 2>/dev/null && return 0
@@ -900,11 +913,45 @@ else
     note "no Go toolchain (set GO or put go on PATH); the Go server is skipped"
 fi
 
+# Over TLS, read from Go's crypto/tls (--tls): the same figures as without.
+# Every Write and the handshake make a socket call that shows the connection.
+if [[ -n "$GO_CMD" && -x "$WORK/go_truth" && -n "$HAVE_TLS" ]]; then
+    tls_on
+    rt_run go-tls "$WORK/go_truth" 8 2000 "$RT_PATHS" && {
+        grep -q "^blame: pid $SERVER_PID: .*TLS read from Go's crypto/tls" "$WORK/r_go-tls.log" \
+            && ok "go-tls: the server's crypto/tls is read" \
+            || bad "go-tls: $(grep "^blame: pid $SERVER_PID" "$WORK/r_go-tls.log")"
+        rt_attributed go-tls
+        expect_no_loss go-tls "$WORK/r_go-tls.log" tls_no_socket tls_unread
+    }
+    rt_run go-tls-busy "$WORK/go_truth" 32 0 "$RT_PATHS" && rt_attributed go-tls-busy
+    tls_off
+fi
+
 TT_TARGET="$(dirname "$(dirname "$BIN")")/tokio_truth"
 tt_build() { cargo build --release --quiet "$@" --manifest-path "$SCN_DIR/../tools/tokio_truth/Cargo.toml" --target-dir "$TT_TARGET"; }
 { tt_build --offline 2>/dev/null || tt_build; } \
     && rt_suite tokio "$TT_TARGET/release/tokio_truth" task-level \
     || bad "tokio: the test server did not build"
+
+# The same server over rustls (tokio-rustls, built with its `tls` feature).
+if [[ -n "$HAVE_TLS" ]]; then
+    ttt_build() { cargo build --release --quiet --features tls "$@" --manifest-path "$SCN_DIR/../tools/tokio_truth/Cargo.toml" --target-dir "$TT_TARGET-tls"; }
+    if { ttt_build --offline 2>/dev/null || ttt_build; }; then
+        tls_on
+        rt_run tokio-tls "$TT_TARGET-tls/release/tokio_truth" 8 2000 "$RT_PATHS" && {
+            grep -q "^blame: pid $SERVER_PID: .*TLS read from rustls" "$WORK/r_tokio-tls.log" \
+                && ok "tokio-tls: the server's rustls is read" \
+                || bad "tokio-tls: $(grep "^blame: pid $SERVER_PID" "$WORK/r_tokio-tls.log")"
+            rt_attributed tokio-tls
+            expect_no_loss tokio-tls "$WORK/r_tokio-tls.log" tls_no_socket tls_unread
+        }
+        rt_run tokio-tls-busy "$TT_TARGET-tls/release/tokio_truth" 32 0 "$RT_PATHS" && rt_attributed tokio-tls-busy
+        tls_off
+    else
+        bad "tokio-tls: the test server did not build"
+    fi
+fi
 
 # A server that starts after the agent is found when it accepts a connection,
 # and looked at within a second; from then on it is attributed by unit.
@@ -1145,6 +1192,13 @@ if [[ -n "${GO_CMD:=${GO:-$(command -v go || true)}}" ]] \
     grpc_case go-stripped 0 "U,SS,CS,BI,T" "$GRPC_PARAMS" -- "$WORK/grpc_go_stripped"
     # Handlers run on a fixed set of goroutines instead of one each.
     grpc_case go-workers 0 "U,BI,T" "$GRPC_PARAMS" -- env WORKERS=8 "$WORK/grpc_go"
+    # Over TLS, read from crypto/tls (--tls): the same.
+    if [[ -n "$HAVE_TLS" ]]; then
+        tls_on
+        grpc_case go-tls 0 "U,SS,CS,BI,T" "$GRPC_PARAMS" -- "$WORK/grpc_go"
+        expect_no_loss go-tls "$WORK/g_go-tls.log" tls_no_socket tls_unread
+        tls_off
+    fi
 
     # The summary does not depend on what is listed: with a threshold no call
     # reaches, nothing is listed and every call is still counted. As a table,
@@ -1211,41 +1265,60 @@ if [[ -n "${GO_CMD:=${GO:-$(command -v go || true)}}" ]] \
     # probes were attached). Whatever is named is right, and handlers are
     # followed. Calls are matched by trace id, or by client port and
     # stream id where there is none.
-    grpc_late go-late "U,SS,CS,BI,T" "$GRPC_PARAMS" -- "$WORK/grpc_go" && {
+    # go_late_checks NAME: what is checked of a go-late case.
+    go_late_checks() {
         # Not joined: the calls in flight when the probes were attached, whose
         # headers were read before. 32 streams are in flight at a time; three
         # times that is allowed, whatever the number of calls.
         (( $(gval reported) > 1000 && $(gval reported) - $(gval joined) <= 96 )) \
-            && ok "go-late: calls on connections older than the agent are reported ($(gval reported), $(minus "$(gval reported)" "$(gval joined)") from before the probes)" \
-            || bad "go-late: reported=$(gval reported) joined=$(gval joined)"
+            && ok "$1: calls on connections older than the agent are reported ($(gval reported), $(minus "$(gval reported)" "$(gval joined)") from before the probes)" \
+            || bad "$1: reported=$(gval reported) joined=$(gval joined)"
         (( $(gval paths) * 100 >= $(gval joined) * 99 && $(gval path_ok) == $(gval paths) )) \
-            && ok "go-late: nearly all get their method ($(gval paths) of $(gval joined)), none a wrong one" \
-            || bad "go-late: paths=$(gval paths) path_ok=$(gval path_ok) of $(gval joined)"
+            && ok "$1: nearly all get their method ($(gval paths) of $(gval joined)), none a wrong one" \
+            || bad "$1: paths=$(gval paths) path_ok=$(gval path_ok) of $(gval joined)"
         # Calls whose headers were read before the probes were on have no
         # trace id; how many depends on how long attaching takes. Every call
         # that started after the agent said it was attached has one.
         (( $(gval late_calls) > 1000 && $(gval late_no_trace) == 0 && $(gval trace_wrong) == 0 )) \
-            && ok "go-late: every call begun after attaching has its trace id ($(gval late_calls); of all $(gval with_trace) of $(gval reported)), none a wrong one" \
-            || bad "go-late: late_calls=$(gval late_calls) late_no_trace=$(gval late_no_trace) trace_wrong=$(gval trace_wrong)"
+            && ok "$1: every call begun after attaching has its trace id ($(gval late_calls); of all $(gval with_trace) of $(gval reported)), none a wrong one" \
+            || bad "$1: late_calls=$(gval late_calls) late_no_trace=$(gval late_no_trace) trace_wrong=$(gval trace_wrong)"
         (( $(gval statuses) * 100 >= $(gval answered) * 97 && $(gval statuses) == $(gval status_ok) )) \
-            && ok "go-late: nearly all answered calls have their status ($(gval statuses) of $(gval answered)), all the server's" \
-            || bad "go-late: statuses=$(gval statuses) status_ok=$(gval status_ok) answered=$(gval answered)"
+            && ok "$1: nearly all answered calls have their status ($(gval statuses) of $(gval answered)), all the server's" \
+            || bad "$1: statuses=$(gval statuses) status_ok=$(gval status_ok) answered=$(gval answered)"
         (( $(gval followed) > 1000 && $(gval unit_ok) == $(gval followed) && $(gval inside) == $(gval followed) \
             && ($(gval joined) - $(gval resets) - $(gval followed)) * 100 <= $(gval joined) )) \
-            && ok "go-late: their handlers are followed ($(gval followed) of $(minus "$(gval joined)" "$(gval resets)") answered)" \
-            || bad "go-late: followed=$(gval followed) unit_ok=$(gval unit_ok) inside=$(gval inside) joined=$(gval joined) resets=$(gval resets)"
+            && ok "$1: their handlers are followed ($(gval followed) of $(minus "$(gval joined)" "$(gval resets)") answered)" \
+            || bad "$1: followed=$(gval followed) unit_ok=$(gval unit_ok) inside=$(gval inside) joined=$(gval joined) resets=$(gval resets)"
         ge "$(gval cpu_ok_pct)" 95 && le "$(gval cpu_err_pct)" 5 \
             && ge "$(awk -v e="$(gval cpu_err_pct)" -v r="$(gval runq_pct)" 'BEGIN { print e + r }')" -5 \
-            && ok "go-late: CPU time matches the server's ($(gval cpu_ok_pct)% of calls, total $(gval cpu_err_pct)%)" \
-            || bad "go-late: CPU time: ok $(gval cpu_ok_pct)%, total $(gval cpu_err_pct)%, run queue $(gval runq_pct)%"
+            && ok "$1: CPU time matches the server's ($(gval cpu_ok_pct)% of calls, total $(gval cpu_err_pct)%)" \
+            || bad "$1: CPU time: ok $(gval cpu_ok_pct)%, total $(gval cpu_err_pct)%, run queue $(gval runq_pct)%"
         # Every call begun after attaching has the two parts.
         if (( $(gval late_followed) > 1000 && $(gval late_untimed) == 0 )); then
-            handler_parts go-late
+            handler_parts "$1"
         else
-            bad "go-late: late_followed=$(gval late_followed) late_untimed=$(gval late_untimed)"
+            bad "$1: late_followed=$(gval late_followed) late_untimed=$(gval late_untimed)"
         fi
-        expect_no_loss go-late "$WORK/g_go-late.log" grpc_handoff_unmatched req_h2_lost
+        expect_no_loss "$1" "$WORK/g_$1.log" grpc_handoff_unmatched req_h2_lost
     }
+    grpc_late go-late "U,SS,CS,BI,T" "$GRPC_PARAMS" -- "$WORK/grpc_go" && go_late_checks go-late
+    # Over TLS: the connections' sessions are placed by the socket calls the
+    # first Reads and Writes after attaching make.
+    if [[ -n "$HAVE_TLS" ]]; then
+        tls_on
+        grpc_late go-tls-late "U,SS,CS,BI,T" "$GRPC_PARAMS" -- "$WORK/grpc_go" && {
+            go_late_checks go-tls-late
+            expect_no_loss go-tls-late "$WORK/g_go-tls-late.log" tls_unread
+            # A Read served from what the session took in before, with no
+            # socket call, until one of its calls makes one: a few on each of
+            # the client's 4 connections, counted.
+            nosock=$(kernel_counter "$WORK/g_go-tls-late.log" tls_no_socket)
+            isnum "$nosock" && (( nosock <= 16 )) \
+                && ok "go-tls-late: calls of sessions older than the agent before their socket was seen: $nosock, counted" \
+                || bad "go-tls-late: tls_no_socket=$nosock"
+        }
+        tls_off
+    fi
 
     # The same, from a client that sends no trace header: every call has the
     # same headers, so HPACK never spells the method out again and the header
@@ -1267,6 +1340,13 @@ if [[ -n "${GO_CMD:=${GO:-$(command -v go || true)}}" ]] \
         # The first calls are not followed: where a task keeps its stream id
         # is found from them.
         grpc_case tonic 5 "U,U,U,T" "$GRPC_PARAMS" hello -- "$GT_TARGET/release/tonic_truth"
+        # Over TLS, read from rustls (--tls): the same.
+        if [[ -n "$HAVE_TLS" ]]; then
+            tls_on
+            grpc_case tonic-tls 5 "U,U,U,T" "$GRPC_PARAMS" hello -- "$GT_TARGET/release/tonic_truth"
+            expect_no_loss tonic-tls "$WORK/g_tonic-tls.log" tls_no_socket tls_unread
+            tls_off
+        fi
         grep -q "^blame: pid [0-9]*: stream handlers found" "$WORK/g_tonic.log" \
             && ok "tonic: where a task keeps its stream id is found while running" \
             || bad "tonic: the stream id was not found in the tasks"
@@ -1274,33 +1354,43 @@ if [[ -n "${GO_CMD:=${GO:-$(command -v go || true)}}" ]] \
         # The same for tonic. Its server does not let a handler see the
         # stream id, so calls cannot be matched one by one: the server has a
         # single method, and every name given must be that one.
-        grpc_late tonic-late "U,U,U,T" "$GRPC_PARAMS" hello -- "$GT_TARGET/release/tonic_truth" && {
-            wrong=$(grep '^req ' "$WORK/g_tonic-late.log" | grep -v ' path=-' | grep -vc ' path=/helloworld.Greeter/SayHello ')
+        # tonic_late_checks NAME: what is checked of a tonic-late case.
+        tonic_late_checks() {
+            wrong=$(grep '^req ' "$WORK/g_$1.log" | grep -v ' path=-' | grep -vc ' path=/helloworld.Greeter/SayHello ')
             (( $(gval reported) > 1000 && $(gval named) * 100 >= $(gval reported) * 95 && wrong == 0 )) \
-                && ok "tonic-late: most calls get their method ($(gval named) of $(gval reported)), none a wrong one" \
-                || bad "tonic-late: reported=$(gval reported) named=$(gval named) wrong=$wrong"
+                && ok "$1: most calls get their method ($(gval named) of $(gval reported)), none a wrong one" \
+                || bad "$1: reported=$(gval reported) named=$(gval named) wrong=$wrong"
             (( $(gval timed) * 100 >= ($(gval reported) - $(gval resets)) * 95 )) \
-                && ok "tonic-late: their handlers are followed ($(gval timed) with time, $(gval resets) reset)" \
-                || bad "tonic-late: timed=$(gval timed) reported=$(gval reported) resets=$(gval resets)"
+                && ok "$1: their handlers are followed ($(gval timed) with time, $(gval resets) reset)" \
+                || bad "$1: timed=$(gval timed) reported=$(gval reported) resets=$(gval resets)"
             (( $(gval late_calls) > 1000 && $(gval late_no_trace) == 0 && $(gval trace_wrong) == 0 )) \
-                && ok "tonic-late: every call begun after attaching has its trace id ($(gval late_calls); of all $(gval with_trace) of $(gval reported)), none a wrong one" \
-                || bad "tonic-late: late_calls=$(gval late_calls) late_no_trace=$(gval late_no_trace) trace_wrong=$(gval trace_wrong)"
+                && ok "$1: every call begun after attaching has its trace id ($(gval late_calls); of all $(gval with_trace) of $(gval reported)), none a wrong one" \
+                || bad "$1: late_calls=$(gval late_calls) late_no_trace=$(gval late_no_trace) trace_wrong=$(gval trace_wrong)"
             (( $(gval statuses) * 100 >= $(gval answered) * 97 && $(gval statuses) == $(gval status_ok) )) \
-                && ok "tonic-late: nearly all answered calls have their status ($(gval statuses) of $(gval answered)), all the server's" \
-                || bad "tonic-late: statuses=$(gval statuses) status_ok=$(gval status_ok) answered=$(gval answered)"
+                && ok "$1: nearly all answered calls have their status ($(gval statuses) of $(gval answered)), all the server's" \
+                || bad "$1: statuses=$(gval statuses) status_ok=$(gval status_ok) answered=$(gval answered)"
             # The status is read in the task that serves the call, as its
             # time is: a call has both or neither.
             (( $(gval status_untimed) == 0 && $(gval timed_no_status) == 0 )) \
-                && ok "tonic-late: a call has its status exactly when its handler is followed ($(( $(gval answered) - $(gval statuses) )) have neither)" \
-                || bad "tonic-late: status_untimed=$(gval status_untimed) timed_no_status=$(gval timed_no_status)"
+                && ok "$1: a call has its status exactly when its handler is followed ($(( $(gval answered) - $(gval statuses) )) have neither)" \
+                || bad "$1: status_untimed=$(gval status_untimed) timed_no_status=$(gval timed_no_status)"
             # Every call begun after attaching has the two parts.
             if (( $(gval late_followed) > 1000 && $(gval late_untimed) == 0 )); then
-                handler_parts tonic-late
+                handler_parts "$1"
             else
-                bad "tonic-late: late_followed=$(gval late_followed) late_untimed=$(gval late_untimed)"
+                bad "$1: late_followed=$(gval late_followed) late_untimed=$(gval late_untimed)"
             fi
-            expect_no_loss tonic-late "$WORK/g_tonic-late.log" grpc_handoff_unmatched req_h2_lost h2_process_unread
+            expect_no_loss "$1" "$WORK/g_$1.log" grpc_handoff_unmatched req_h2_lost h2_process_unread
         }
+        grpc_late tonic-late "U,U,U,T" "$GRPC_PARAMS" hello -- "$GT_TARGET/release/tonic_truth" && tonic_late_checks tonic-late
+        if [[ -n "$HAVE_TLS" ]]; then
+            tls_on
+            grpc_late tonic-tls-late "U,U,U,T" "$GRPC_PARAMS" hello -- "$GT_TARGET/release/tonic_truth" && {
+                tonic_late_checks tonic-tls-late
+                expect_no_loss tonic-tls-late "$WORK/g_tonic-tls-late.log" tls_no_socket tls_unread
+            }
+            tls_off
+        fi
         # No trace header: the method is the only thing the process has to say.
         NO_TRACEPARENT=1 grpc_late tonic-late-notrace "U,U" "$GRPC_PARAMS" hello -- "$GT_TARGET/release/tonic_truth" && {
             wrong=$(grep '^req ' "$WORK/g_tonic-late-notrace.log" | grep -v ' path=-' | grep -vc ' path=/helloworld.Greeter/SayHello ')
@@ -1750,6 +1840,30 @@ else
     (( $(tv lost) == 0 )) \
         && ok "tls: nothing lost" \
         || bad "tls: lost: $(grep -o '"lost":{[^}]*}' "$WORK/tls.json" | tail -1)"
+
+    # Without --tls nothing over TLS is read, and that is not silent: each
+    # connection that began with a handshake is counted as unread. (Python's
+    # OpenSSL sets the socket up for kernel TLS here, puts no keys in: not
+    # taken up by the kernel, still unread.)
+    spawn python3 "$WORKLOADS/tls_http.py" server "$PORT" "$WORK/tls.crt" "$WORK/tls.key"
+    tls_server=${_TRACKED[-1]}
+    sleep 0.5
+    sudo -n "$BIN" slow --json --above 0 --list 0 --interval 0 --pid "$tls_server" \
+        >"$WORK/tls-off.json" 2>"$WORK/tls-off.err" &
+    AGENT_JOB=$!
+    for _ in $(seq 100); do
+        grep -q '"type":"process"' "$WORK/tls-off.json" 2>/dev/null && break
+        sleep 0.1
+    done
+    opened=$(python3 "$WORKLOADS/tls_http.py" load "$PORT" 2 4 | grep -oP '(?<=connections=)[0-9]+')
+    sleep 0.5
+    stop_agent
+    stop_servers
+    unread=$(grep '"scope":"total"' "$WORK/tls-off.json" | grep -oP '(?<="tls_unread":)[0-9]+' | tail -1)
+    calls=$(grep -c '"type":"call"' "$WORK/tls-off.json")
+    isnum "$opened" && (( opened > 4 && ${unread:-0} == opened && calls == 0 )) \
+        && ok "tls: without --tls, every connection over TLS is counted as unread ($unread of $opened), no request made up" \
+        || bad "tls: without --tls: tls_unread=${unread:-none} of ${opened:-?} connections, $calls requests"
 fi
 }
 

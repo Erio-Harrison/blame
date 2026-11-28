@@ -184,6 +184,49 @@ fn go_functions<const N: usize>(elf: &Elf, names: [&str; N]) -> [Option<u64>; N]
     found
 }
 
+/// Where the functions `names` start and end (the next function's start),
+/// from the Go function table, which stripping leaves in place. `None` for
+/// one that is not there, or all of them if the table is not understood.
+pub(crate) fn go_function_ranges<const N: usize>(
+    elf: &Elf,
+    names: [&str; N],
+) -> [Option<(u64, u64)>; N] {
+    let mut found = [None; N];
+    let mut lookup = || -> Option<()> {
+        let table = elf.section(".gopclntab")?;
+        let magic = u32_le(table, 0)?;
+        if !(magic == 0xffff_fff0 || magic == 0xffff_fff1) || *table.get(7)? != 8 {
+            return None;
+        }
+        let count = u64_le(table, 8)? as usize;
+        let text = match u64_le(table, 24)? {
+            0 => elf.section_addr(".text")?,
+            start => start,
+        };
+        let names_at = u64_le(table, 32)? as usize;
+        let funcs_at = u64_le(table, 64)? as usize;
+        // count entries of (entry, function), then the end of the last one.
+        for i in 0..count {
+            let entry = u32_le(table, funcs_at + 8 * i)?;
+            let next = u32_le(table, funcs_at + 8 * (i + 1))?;
+            let func = funcs_at + u32_le(table, funcs_at + 8 * i + 4)? as usize;
+            let name_at = names_at + u32_le(table, func + 4)? as usize;
+            let rest = table.get(name_at..)?;
+            let name = &rest[..rest.iter().position(|b| *b == 0)?];
+            for (slot, wanted) in found.iter_mut().zip(names) {
+                if slot.is_none() && name == wanted.as_bytes() && next > entry {
+                    *slot = Some((text + u64::from(entry), text + u64::from(next)));
+                }
+            }
+        }
+        Some(())
+    };
+    if lookup().is_none() {
+        return [None; N];
+    }
+    found
+}
+
 /// Every function in the Go function table, by name and entry address.
 /// `None` if the table is not understood.
 fn walk_functions(elf: &Elf, mut visit: impl FnMut(&[u8], u64)) -> Option<()> {

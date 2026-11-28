@@ -268,7 +268,7 @@ pub(super) fn attach(opt: &SlowOpt) -> Result<Attached> {
     let mut found_in = Vec::new();
     let mut probe_links = Vec::new();
     for pid in traced {
-        let (found, links) = inspect_and_attach(&skel, opt, *pid);
+        let (found, links, tls) = inspect_and_attach(&skel, opt, *pid);
         probe_links.extend(links);
         if skel
             .maps
@@ -278,7 +278,7 @@ pub(super) fn attach(opt: &SlowOpt) -> Result<Attached> {
         {
             procs_left_out += 1;
         } else {
-            found_in.push((*pid, found));
+            found_in.push((*pid, found, tls));
         }
     }
     // The scheduler hook passes over threads of processes without a bit here.
@@ -287,7 +287,7 @@ pub(super) fn attach(opt: &SlowOpt) -> Result<Attached> {
         .bss_data
         .as_deref_mut()
         .context("the eBPF object has no zero-initialised data")?;
-    for (pid, _) in &found_in {
+    for (pid, _, _) in &found_in {
         let bit = *pid as usize % (bits.proc_bits.len() * 64);
         bits.proc_bits[bit / 64] |= 1 << (bit % 64);
     }
@@ -323,13 +323,20 @@ pub(super) fn attach(opt: &SlowOpt) -> Result<Attached> {
         links.push(unsafe { Link::from_ptr(link) });
     }
     // The TLS probes start requests too: only now that the rest is on.
-    let notes = found_in
-        .into_iter()
-        .map(|(pid, mut found)| {
-            probe_links.extend(follow_tls(&skel, opt, pid, &mut found));
-            ProcessNote::of(pid, &found)
-        })
-        .collect();
+    let mut notes = Vec::new();
+    for (pid, mut found, tls) in found_in {
+        let flags = found.cfg.flags;
+        probe_links.extend(follow_tls(&skel, pid, tls, &mut found));
+        // Its probes could not go on: the process is told no TLS is read after all.
+        if found.cfg.flags != flags {
+            let _ = skel.maps.REQ_PROCS.update(
+                &pid.to_ne_bytes(),
+                &found.cfg.to_bytes(),
+                MapFlags::ANY,
+            );
+        }
+        notes.push(ProcessNote::of(pid, &found));
+    }
 
     let bytes = |map: &dyn MapCore| {
         u64::from(map.max_entries()) * u64::from(map.key_size() + map.value_size())

@@ -108,13 +108,18 @@ pub struct SlowOpt {
     /// of a team that take up a request's work, shown the same way.
     #[clap(long, alias = "spawned", conflicts_with = "threads_only")]
     deep: bool,
-    /// Read the requests of TLS connections (HTTPS) from the TLS library
-    /// where it hands the plaintext over: OpenSSL's libssl (`SSL_read`,
-    /// `SSL_write` and their `_ex` forms, `SSL_sendfile`), in each traced
-    /// process that has loaded it. Each of those calls then costs a trap into
-    /// the kernel: on light requests over TLS that is a large share of
-    /// throughput (measured: some 40-50% for a 100-byte response at 60k
-    /// requests/s), so it is off unless asked for.
+    /// Read the requests of TLS connections (HTTPS, gRPC over TLS) from the
+    /// TLS library where it hands the plaintext over, in each traced process:
+    /// OpenSSL's libssl when it is loaded (`SSL_read`, `SSL_write` and their
+    /// `_ex` forms, `SSL_sendfile`), Go's crypto/tls (`(*Conn).Read` and
+    /// `Write`, on arm64), rustls 0.23. Each of those calls then costs a trap
+    /// into the kernel, two for Go's: on light requests over TLS that is a
+    /// large share of throughput (measured with one CPU saturated, on top of
+    /// what the agent costs without it: some 10-17% for gRPC calls, 25-30%
+    /// for HTTP/1.1 requests of 100 bytes, 40-50% with OpenSSL at 60k
+    /// requests/s), so it is off unless asked for. Without it, client
+    /// connections that begin with a TLS handshake are counted as
+    /// `tls_unread`.
     #[clap(long)]
     tls: bool,
 }

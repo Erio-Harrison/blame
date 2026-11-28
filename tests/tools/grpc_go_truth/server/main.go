@@ -41,6 +41,7 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/encoding"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/peer"
@@ -253,6 +254,14 @@ func main() {
 		panic(err)
 	}
 	opts := []grpc.ServerOption{grpc.StatsHandler(heard{})}
+	// With TLS_CERT and TLS_KEY set (PEM files): over TLS.
+	if crt := os.Getenv("TLS_CERT"); crt != "" {
+		creds, err := credentials.NewServerTLSFromFile(crt, os.Getenv("TLS_KEY"))
+		if err != nil {
+			panic(err)
+		}
+		opts = append(opts, grpc.Creds(creds))
+	}
 	if v, _ := strconv.Atoi(os.Getenv("WORKERS")); v > 0 {
 		opts = append(opts, grpc.NumStreamWorkers(uint32(v)))
 	}

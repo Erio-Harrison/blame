@@ -4,7 +4,8 @@ sessions placed by SSL_set_fd), for `blame slow --tls`.
 
     tls_http.py server PORT CERT KEY       GET /sleep: sleeps 20 ms, answers "ok"
     tls_http.py load PORT SECONDS CONNS    each connection keeps alive for 20
-                                           requests, then a new one is opened
+                                           requests, then a new one is opened;
+                                           prints `connections=N` it opened
 
 The handler's time is all asleep: a request blame reports with its time on a
 CPU is one whose thread's sleeps it did not see.
@@ -50,10 +51,12 @@ def load(port, seconds, conns):
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
     end = time.monotonic() + seconds
+    opened = []
 
     def one():
         while time.monotonic() < end:
             c = http.client.HTTPSConnection("127.0.0.1", port, context=ctx)
+            opened.append(1)
             try:
                 for _ in range(20):
                     if time.monotonic() >= end:
@@ -70,6 +73,7 @@ def load(port, seconds, conns):
         t.start()
     for t in threads:
         t.join()
+    print(f"connections={len(opened)}")
 
 
 if __name__ == "__main__":

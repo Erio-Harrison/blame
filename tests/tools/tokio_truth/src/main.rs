@@ -37,7 +37,7 @@ use std::{
 };
 
 use tokio::{
-    io::{AsyncReadExt as _, AsyncWriteExt as _},
+    io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _},
     net::{TcpListener, TcpStream},
     signal::unix::{signal, SignalKind},
 };
@@ -233,9 +233,77 @@ async fn call(down: &mut Option<TcpStream>, backend: u16, us: i64) -> bool {
     }
 }
 
-async fn serve(mut stream: TcpStream, backend: Option<u16>) {
+/// A connection accepted: over TLS when the server has a certificate.
+async fn accepted(stream: TcpStream, backend: Option<u16>) {
     let port = stream.peer_addr().map_or(0, |addr| u32::from(addr.port()));
     let _ = stream.set_nodelay(true);
+    #[cfg(feature = "tls")]
+    if let Some(acceptor) = tls::acceptor() {
+        if let Ok(stream) = acceptor.accept(stream).await {
+            serve(stream, port, backend, true).await;
+        }
+        return;
+    }
+    serve(stream, port, backend, false).await;
+}
+
+/// All of `head` then `body`, handed over as a list of two buffers (a vectored
+/// write) as far as the stream takes them.
+async fn write_all_vectored<S: AsyncWrite + Unpin>(stream: &mut S, head: &[u8], body: &[u8]) -> bool {
+    let (mut head, mut body) = (head, body);
+    while !head.is_empty() || !body.is_empty() {
+        let slices = [std::io::IoSlice::new(head), std::io::IoSlice::new(body)];
+        let n = match stream.write_vectored(&slices).await {
+            Ok(n) if n > 0 => n,
+            _ => return false,
+        };
+        let from_head = n.min(head.len());
+        head = &head[from_head..];
+        body = &body[n - from_head..];
+    }
+    stream.flush().await.is_ok()
+}
+
+/// With the `tls` feature and TLS_CERT and TLS_KEY set (PEM files), the
+/// server speaks HTTPS through rustls (tokio-rustls). A request starts when
+/// its plaintext is read and ends when its answer is handed to TLS, as
+/// without TLS.
+#[cfg(feature = "tls")]
+mod tls {
+    use std::sync::{Arc, OnceLock};
+
+    use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+    use tokio_rustls::{TlsAcceptor, rustls::ServerConfig};
+
+    pub fn acceptor() -> Option<TlsAcceptor> {
+        static ACCEPTOR: OnceLock<Option<TlsAcceptor>> = OnceLock::new();
+        ACCEPTOR
+            .get_or_init(|| {
+                let cert = std::env::var("TLS_CERT").ok()?;
+                let key = std::env::var("TLS_KEY").ok()?;
+                let certs = CertificateDer::pem_file_iter(cert)
+                    .expect("TLS_CERT")
+                    .map(|c| c.expect("certificate"))
+                    .collect();
+                let key = PrivateKeyDer::from_pem_file(key).expect("TLS_KEY");
+                let config = ServerConfig::builder()
+                    .with_no_client_auth()
+                    .with_single_cert(certs, key)
+                    .expect("certificate and key");
+                Some(TlsAcceptor::from(Arc::new(config)))
+            })
+            .clone()
+    }
+}
+
+/// `vectored`: answer with the head and the body as two buffers of one write
+/// (over TLS: rustls is then handed a list of them), not as one.
+async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
+    mut stream: S,
+    port: u32,
+    backend: Option<u16>,
+    vectored: bool,
+) {
     let mut down = None;
     let mut buf: Vec<u8> = Vec::with_capacity(8192);
     let mut chunk = [0u8; 8192];
@@ -328,11 +396,17 @@ async fn serve(mut stream: TcpStream, backend: Option<u16>) {
             n if n < 0 => 64,
             n => (n as usize).min(body.len()),
         };
-        let mut response =
-            format!("HTTP/1.1 200 OK\r\nServer: tt\r\nContent-Length: {size}\r\n\r\n").into_bytes();
-        response.extend_from_slice(&body[..size]);
-        if stream.write_all(&response).await.is_err() {
-            return;
+        let head = format!("HTTP/1.1 200 OK\r\nServer: tt\r\nContent-Length: {size}\r\n\r\n");
+        if vectored {
+            if !write_all_vectored(&mut stream, head.as_bytes(), &body[..size]).await {
+                return;
+            }
+        } else {
+            let mut response = head.into_bytes();
+            response.extend_from_slice(&body[..size]);
+            if stream.write_all(&response).await.is_err() {
+                return;
+            }
         }
         rec.t1 = now();
         LOG.lock().unwrap().push(rec);
@@ -387,7 +461,7 @@ fn main() {
             .expect("listen");
         loop {
             if let Ok((stream, _)) = listener.accept().await {
-                tokio::spawn(serve(stream, backend));
+                tokio::spawn(accepted(stream, backend));
             }
         }
     });

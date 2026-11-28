@@ -5,7 +5,7 @@
 use std::path::Path;
 
 use anyhow::{Context as _, Result};
-use blame_common::ProcCfg;
+use blame_common::{PROC_F_GO_TLS, PROC_F_TLS_READ, ProcCfg};
 use libbpf_rs::{Link, MapCore as _, MapFlags};
 
 use super::{SlowOpt, attach::Attached};
@@ -266,24 +266,44 @@ pub(super) fn follow_openmp_functions(attached: &Attached) {
     }
 }
 
-/// With `--tls`, in a process that has loaded a TLS library blame knows:
-/// probes where it hands over the plaintext of its connections, so that
-/// requests over TLS are read (`crate::tls`). All of them, or none.
+/// With `--tls`: the TLS libraries `pid` reads its connections through
+/// (`crate::tls`). What the kernel side is told about them goes into
+/// `found.cfg` now, before the request programs are on: a connection that
+/// begins with a handshake is then not counted as unread while their probes
+/// are not on yet. What cannot be read is said with the process.
+fn find_tls(opt: &SlowOpt, pid: u32, found: &mut Inspected) -> Option<crate::tls::Found> {
+    if !opt.tls {
+        return None;
+    }
+    let tls = crate::tls::find(Path::new("/proc"), pid);
+    found.cfg.flags |= tls.flags();
+    found.unsupported.extend(tls.unread.iter().cloned());
+    Some(tls)
+}
+
+/// The probes where the TLS libraries `tls` of `pid` hand over the plaintext
+/// of its connections, so that requests over TLS are read. All of them, or
+/// none: then `found.cfg` says no TLS is read, and the caller writes it again.
 ///
 /// These probes start requests, so they go on only once the request programs
 /// are on: a request started before the scheduler hook was there would have
 /// all its time taken for time on a CPU (at start, for the second or so the
 /// request programs take to attach).
-pub(super) fn follow_tls(skel: &Skel, opt: &SlowOpt, pid: u32, found: &mut Inspected) -> Vec<Link> {
-    if !opt.tls {
+pub(super) fn follow_tls(
+    skel: &Skel,
+    pid: u32,
+    tls: Option<crate::tls::Found>,
+    found: &mut Inspected,
+) -> Vec<Link> {
+    let Some(tls) = tls else {
         return Vec::new();
-    }
-    match crate::tls::follow(skel, pid) {
+    };
+    match crate::tls::attach(skel, pid, &tls) {
         Ok(None) => Vec::new(),
-        Ok(Some((tls, links))) => {
+        Ok(Some((what, links))) => {
             found.note = Some(match found.note.take() {
-                Some(note) => format!("{note}; {tls}"),
-                None => tls,
+                Some(note) => format!("{note}; {what}"),
+                None => what,
             });
             links
         }
@@ -293,15 +313,26 @@ pub(super) fn follow_tls(skel: &Skel, opt: &SlowOpt, pid: u32, found: &mut Inspe
                 "blame: pid {pid}: TLS not read: {text}{}",
                 attach_hint(&text)
             );
+            found.cfg.flags &= !(PROC_F_TLS_READ | PROC_F_GO_TLS);
             Vec::new()
         }
     }
 }
 
+/// What [`inspect_and_attach`] found: how the process is attributed, the
+/// probes it attached, and the TLS libraries to follow ([`follow_tls`]).
+pub(super) type Looked = (Inspected, Vec<Link>, Option<crate::tls::Found>);
+
 /// Look at a process and attach what its attribution needs, but the TLS
 /// probes ([`follow_tls`]). If the probes cannot be attached, the process is
 /// attributed without them.
-pub(super) fn inspect_and_attach(skel: &Skel, opt: &SlowOpt, pid: u32) -> (Inspected, Vec<Link>) {
+pub(super) fn inspect_and_attach(skel: &Skel, opt: &SlowOpt, pid: u32) -> Looked {
+    let (mut found, links) = inspect_and_attach_runtime(skel, opt, pid);
+    let tls = find_tls(opt, pid, &mut found);
+    (found, links, tls)
+}
+
+fn inspect_and_attach_runtime(skel: &Skel, opt: &SlowOpt, pid: u32) -> (Inspected, Vec<Link>) {
     let mut found = inspect(opt, pid);
     if found.probes.is_empty() {
         let links = follow_openmp(skel, opt, pid, &mut found);
@@ -396,9 +427,9 @@ pub(super) fn inspect_new_processes(attached: &Attached, opt: &SlowOpt) {
             continue;
         };
         // The request programs are on by now: the TLS probes can go on with the rest.
-        let (mut found, links) = inspect_and_attach(&attached.skel, opt, pid);
+        let (mut found, links, tls) = inspect_and_attach(&attached.skel, opt, pid);
         attached.probe_links.borrow_mut().extend(links);
-        let links = follow_tls(&attached.skel, opt, pid, &mut found);
+        let links = follow_tls(&attached.skel, pid, tls, &mut found);
         attached.probe_links.borrow_mut().extend(links);
         // Only if the process is still there: it may have exited meanwhile.
         if procs

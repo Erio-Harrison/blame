@@ -5,6 +5,8 @@
 //
 //	go_truth PORT LOGFILE [-b BACKEND_PORT] [-p GOMAXPROCS]
 //
+// With TLS_CERT and TLS_KEY set (PEM files), it serves HTTPS.
+//
 // Query parameters: size=N body bytes, cpu=US spin, sleep=US (time.Sleep: the
 // goroutine parks, its thread goes on to other goroutines), d=US (a call to
 // the backend, an http_truth server, on a connection of the goroutine's own),
@@ -31,6 +33,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/binary"
 	"fmt"
 	"net"
@@ -438,6 +441,17 @@ func main() {
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
+	}
+	// With TLS_CERT and TLS_KEY: HTTPS. The connection the log is kept by
+	// wraps the TLS one, so that a request starts when its plaintext is read
+	// and ends when its answer is handed to TLS, as without TLS.
+	if crt := os.Getenv("TLS_CERT"); crt != "" {
+		cert, err := tls.LoadX509KeyPair(crt, os.Getenv("TLS_KEY"))
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		l = tls.NewListener(l, &tls.Config{Certificates: []tls.Certificate{cert}})
 	}
 	srv := &http.Server{
 		Handler: http.HandlerFunc(handle),

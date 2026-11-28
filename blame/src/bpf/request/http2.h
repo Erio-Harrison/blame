@@ -211,7 +211,14 @@ static __always_inline bool h2_call(struct conn *c, u64 sk, struct carrier *cr, 
 	x->seg_len = d->iov ? 0 : d->len[0];
 	x->so = 0;
 	x->left = d->total;
-	x->si = 0;
+	/* Given buffers: the first is in seg_base already. */
+	x->si = d->iov ? 0 : 1;
+	x->nseg = d->iov ? 0 : d->nseg;
+#pragma unroll
+	for (int i = 0; i < HTTP_SEGS; i++) {
+		x->sb[i] = d->base[i];
+		x->sl[i] = d->len[i];
+	}
 	x->max_sid = c->h2_max_sid;
 	x->nev = 0;
 	x->steps = 0;

@@ -125,7 +125,18 @@ fn main() {
             let _ = std::fs::File::create(&path).and_then(|mut f| f.write_all(lines.as_bytes()));
             std::process::exit(0);
         });
-        Server::builder()
+        // With TLS_CERT and TLS_KEY set (PEM files): over TLS, through rustls.
+        let mut builder = Server::builder();
+        if let Ok(cert) = std::env::var("TLS_CERT") {
+            let identity = tonic::transport::Identity::from_pem(
+                std::fs::read(cert).expect("TLS_CERT"),
+                std::fs::read(std::env::var("TLS_KEY").expect("TLS_KEY")).expect("TLS_KEY"),
+            );
+            builder = builder
+                .tls_config(tonic::transport::ServerTlsConfig::new().identity(identity))
+                .expect("TLS");
+        }
+        builder
             .add_service(GreeterServer::new(Hello))
             .serve(format!("127.0.0.1:{}", args[1]).parse().unwrap())
             .await

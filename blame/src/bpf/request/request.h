@@ -55,6 +55,8 @@
 /* Probes inside runtimes and libraries; they use everything above. */
 #include "../tls/openssl.h"
 #include "../runtime/go_grpc.h"
+#include "../tls/go_tls.h"
+#include "../tls/rustls.h"
 #include "../runtime/go_spawn.h"
 #include "../runtime/go_park.h"
 #include "../runtime/tokio_tasks.h"

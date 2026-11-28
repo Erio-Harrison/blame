@@ -15,9 +15,12 @@
 // With `hello`, every call is a unary /helloworld.Greeter/SayHello with the
 // parameters as the name of a protobuf HelloRequest: what the tonic server
 // speaks.
+//
+// With GRPC_TLS set, the calls go over TLS (the certificate not checked).
 package main
 
 import (
+	"crypto/tls"
 	"context"
 	"fmt"
 	"io"
@@ -30,6 +33,7 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
 )
@@ -60,7 +64,11 @@ func main() {
 	end := time.Now().Add(time.Duration(secs * float64(time.Second)))
 	co := grpc.ForceCodec(raw{})
 	for c := 0; c < conns; c++ {
-		cc, err := grpc.NewClient("127.0.0.1:"+os.Args[1], grpc.WithTransportCredentials(insecure.NewCredentials()))
+		creds := insecure.NewCredentials()
+		if os.Getenv("GRPC_TLS") != "" {
+			creds = credentials.NewTLS(&tls.Config{InsecureSkipVerify: true})
+		}
+		cc, err := grpc.NewClient("127.0.0.1:"+os.Args[1], grpc.WithTransportCredentials(creds))
 		if err != nil {
 			panic(err)
 		}

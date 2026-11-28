@@ -53,7 +53,8 @@ static __always_inline void tls_mark(struct sock *sk)
 		if (!c)
 			return;
 	}
-	if (c->cls != CONN_CLIENT || c->tls)
+	/* 2: seen to begin with a handshake, not read yet (request/calls.h). */
+	if (c->cls != CONN_CLIENT || c->tls == 1)
 		return;
 	c->tls = 1;
 	bump(TLS_FOLLOWED);
@@ -138,47 +139,92 @@ static __always_inline u64 tls_outp(void)
 }
 
 /*
- * The call `fn` returns with the stack pointer `sp`, having moved `n` bytes
- * of plaintext (<= 0: none), received if `read`. Not inlined: with the
- * parsers on_data brings in, the probe's own stack would not fit.
+ * The call tls_feed() describes: not on its stack, which a socket call's
+ * own (rustls: tls/rustls.h) is under, with the parsers' on top.
  */
-static __noinline void tls_end(u8 fn, bool read, s64 n, u64 sp)
-{
-	struct carrier *cr = carrier_of_current(false);
-	struct call_data d = {};
-	struct tls_key key = {};
-	u64 *skp, sk;
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, u32);
+	__type(value, struct call_data);
+} TLS_CALL SEC(".maps");
 
-	/* Not the one followed: a call made inside it returns further down the stack. */
-	if (!cr || cr->tls_fn != fn || sp < cr->tls_sp)
+/*
+ * `n` bytes of plaintext at `buf`, moved on client socket `sk` (marked as a
+ * TLS one), received if `read`. Not inlined: with the parsers on_data
+ * brings in, a probe's own stack would not fit.
+ */
+static __always_inline void tls_feed_here(struct carrier *cr, u64 sk, u64 buf, u64 n, bool read)
+{
+	u32 zero = 0;
+	struct call_data *d = bpf_map_lookup_elem(&TLS_CALL, &zero);
+
+	if (!d)
 		return;
-	cr->tls_fn = 0;
-	if (n <= 0)
+	__builtin_memset(d, 0, sizeof(*d));
+	d->nseg = 1;
+	d->base[0] = buf;
+	d->len[0] = n;
+	d->total = n;
+	on_data((struct sock *)sk, cr, read, d, true);
+}
+
+static __noinline void tls_feed(struct carrier *cr, u64 sk, u64 buf, u64 n, bool read)
+{
+	tls_feed_here(cr, sk, buf, n, read);
+}
+
+/*
+ * `n` bytes of plaintext (<= 0: none) at `buf`, moved by a TLS library's
+ * call on the session `key` names (of the current process), received if
+ * `read`. `sk`: the socket a socket call made inside that call went to (0:
+ * none), which places the session; otherwise the session's known socket.
+ * `key` is the caller's, so that a probe's stack holds one.
+ */
+static __always_inline void tls_deliver(struct carrier *cr, struct tls_key *key, u64 buf, s64 n,
+					u64 sk, bool read)
+{
+	u64 *skp;
+
+	if (!cr || n <= 0)
 		return;
-	key.tgid = cur_pid_tgid() >> 32;
-	key.ssl = cr->tls_ssl;
-	skp = bpf_map_lookup_elem(&TLS_SESSIONS, &key);
-	if (cr->tls_sk) {
+	skp = bpf_map_lookup_elem(&TLS_SESSIONS, key);
+	if (sk) {
 		/*
 		 * The socket call it just made shows where it is: a session set up
 		 * before the probes, or given its socket other than by the library
 		 * call that tells (SSL_set_bio), whose object may sit where one of
 		 * another connection was freed.
 		 */
-		sk = cr->tls_sk;
-		if (!skp || *skp != sk)
-			tls_place(key.tgid, key.ssl, (struct sock *)sk);
+		if (!skp || *skp != sk) {
+			bpf_map_update_elem(&TLS_SESSIONS, key, &sk, BPF_ANY);
+			tls_mark((struct sock *)sk);
+		}
 	} else if (skp) {
 		sk = *skp;
 	} else {
 		bump(TLS_NO_SOCKET);
 		return;
 	}
-	d.nseg = 1;
-	d.base[0] = cr->tls_buf;
-	d.len[0] = n;
-	d.total = n;
-	on_data((struct sock *)sk, cr, read, &d, true);
+	tls_feed(cr, sk, buf, n, read);
+}
+
+/*
+ * The call `fn` returns with the stack pointer `sp`, having moved `n` bytes
+ * of plaintext (<= 0: none), received if `read`.
+ */
+static __always_inline void tls_end(u8 fn, bool read, s64 n, u64 sp)
+{
+	struct carrier *cr = carrier_of_current(false);
+	struct tls_key key = {};
+
+	/* Not the one followed: a call made inside it returns further down the stack. */
+	if (!cr || cr->tls_fn != fn || sp < cr->tls_sp)
+		return;
+	cr->tls_fn = 0;
+	key.tgid = cur_pid_tgid() >> 32;
+	key.ssl = cr->tls_ssl;
+	tls_deliver(cr, &key, cr->tls_buf, n, cr->tls_sk, read);
 }
 
 #endif

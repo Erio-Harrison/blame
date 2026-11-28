@@ -129,7 +129,9 @@ struct conn {
 	 * (tls/tls.h), not from the socket calls, which carry ciphertext.
 	 */
 	u8 tls;
-	u8 _pad_tls[7];
+	/* Its first bytes were looked at for a TLS handshake (TLS_UNREAD). */
+	u8 tls_hello;
+	u8 _pad_tls[6];
 	char rx_line[REQ_LINE_LEN];
 };
 
@@ -333,7 +335,22 @@ struct carrier {
 	u64 tls_sk;
 	u64 tls_sp;
 	u8 tls_fn;
-	u8 _pad6[7];
+	/*
+	 * rustls (tls/rustls.h): plaintext handed to the library to send whose
+	 * socket is the next socket call's, if that is a write of the same unit:
+	 * rs_tx buffers (0 = none), the last of them bytes not seen if its base
+	 * is 0, rs_tx_total bytes in all. Copied when handed over: rustls's list
+	 * of them is gone by the write.
+	 */
+	u8 rs_tx;
+	u8 _pad6[6];
+	u64 rs_tx_base[HTTP_SEGS];
+	u64 rs_tx_len[HTTP_SEGS];
+	u64 rs_tx_total;
+	struct unit_key rs_tx_unit;
+	/* The socket the thread last read from, and the unit that read it. */
+	u64 rs_rd_sk;
+	struct unit_key rs_rd_unit;
 };
 
 /*

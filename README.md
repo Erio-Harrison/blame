@@ -96,18 +96,31 @@ NAS, SMB, virtiofs) are shown as `fileservice`, apart from the local disk;
 the part of it spent waiting for a lock another thread held, mostly another
 request writing or flushing the same file, is shown with it
 (`fileservice=76ms(lock=72ms)`).
-With `--tls`, HTTPS requests are read where OpenSSL's libssl, loaded as a
-shared library, hands their plaintext over (`SSL_read`, `SSL_write` and their
-`_ex` forms), and broken down the same way: on a C++ server with a thread per
-connection, against its own figures, within 3% for each part, on connections
-opened before blame as after. Each of those calls then costs a trap into the
-kernel, some 40-50% of throughput on light requests, so it is off unless
-asked for. What it does not read: TLS libraries other than OpenSSL (Go's
-`crypto/tls`, rustls, Java's own), a TLS library linked into the program
-instead of loaded (the BoringSSL that gRPC's CMake build and the `grpcio`
-wheels bring), and OpenSSL used over buffers in memory rather than the
-socket: gRPC's C++ core, also when built on the system's libssl, and Python's
-asyncio, whose calls are counted as `tls_no_socket`.
+With `--tls`, requests over TLS (HTTPS, gRPC over TLS) are read where the
+TLS library hands their plaintext over: OpenSSL's libssl loaded as a shared
+library (`SSL_read`, `SSL_write` and their `_ex` forms), Go's `crypto/tls`
+(`(*Conn).Read` and `Write`, found in stripped binaries too; arm64 only), and
+rustls 0.23 (`take_received_plaintext` and `send_appdata_encrypt`, which
+keep their symbols with fat or thin LTO). They are broken down the same way:
+the Go, tokio, grpc-go and tonic servers the acceptance tests check against
+pass the same checks over TLS as without it, on connections opened before
+blame as after (a few reads on those older connections, made before their
+socket was seen, are counted as `tls_no_socket`), and a C++ server with a
+thread per connection over OpenSSL is within 3% of its own figures for each
+part. Each of those calls costs a trap into the kernel, two for Go's: on
+light requests, with one CPU saturated, another 10-17% of throughput for
+gRPC calls and 25-30% for HTTP/1.1 on top of what the agent costs without
+it, and 40-50% with OpenSSL at 60k requests/s, so it is off unless asked
+for. Without it, client connections that begin with a TLS handshake are
+counted as `tls_unread`, so that requests not seen for that are not silent;
+those that kernel TLS takes up after the handshake are read from their
+socket calls instead (the first request of each is lost). What it does not
+read: other TLS libraries (Java's own, rustls before 0.23), Go on x86-64, a
+TLS library linked into the program but Go's and rustls (the BoringSSL that
+gRPC's CMake build and the `grpcio` wheels bring), and OpenSSL used over
+buffers in memory rather than the socket: gRPC's C++ core, also when built on
+the system's libssl, and Python's asyncio, whose calls are counted as
+`tls_no_socket`.
 Not covered yet: TLS other than the above, io_uring, a time breakdown for
 HTTP/2 servers other than grpc-go and tonic (they get latency, method, status
 and trace id), runtimes other than Go and tokio (they are seen thread by

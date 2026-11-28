@@ -30,6 +30,11 @@ impl Counters {
             *slot = percpu_u64_sum(&skel.maps.COUNTERS, index as u32)
                 .with_context(|| format!("reading counter {index}"))?;
         }
+        // A connection kernel TLS took up after its handshake was counted
+        // as unread at the handshake: it is not.
+        let kernel = values[Counter::TlsKernel as usize];
+        let unread = &mut values[Counter::TlsUnread as usize];
+        *unread = unread.saturating_sub(kernel);
         Ok(Self { values })
     }
 

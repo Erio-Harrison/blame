@@ -9,7 +9,11 @@ pub(crate) struct Elf<'a> {
     /// Loaded segments: (address, offset in the file, bytes in the file).
     loads: Vec<(u64, u64, u64)>,
     pub tls: Option<TlsSegment>,
+    /// `e_machine`: [`EM_AARCH64`], 62 for x86-64, ...
+    pub machine: u16,
 }
+
+pub(crate) const EM_AARCH64: u16 = 183;
 
 struct Section<'a> {
     name: &'a [u8],
@@ -115,6 +119,7 @@ impl<'a> Elf<'a> {
             sections,
             loads,
             tls,
+            machine: u16_at(image, 0x12)?,
         })
     }
 
@@ -140,6 +145,12 @@ impl<'a> Elf<'a> {
             .iter()
             .find(|&&(start, _, size)| addr >= start && addr - start < size)
             .map(|&(start, offset, _)| addr - start + offset)
+    }
+
+    /// The `len` bytes the file holds at address `addr`, if it holds them.
+    pub fn bytes_at(&self, addr: u64, len: usize) -> Option<&'a [u8]> {
+        let at = usize::try_from(self.file_offset(addr)?).ok()?;
+        self.image.get(at..at.checked_add(len)?)
     }
 
     /// Addresses of the functions whose symbol names contain every one of
@@ -237,7 +248,7 @@ impl<'a> Elf<'a> {
 }
 
 /// Where `needle` first occurs in `haystack`.
-pub(super) fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+pub(crate) fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     let first = needle[0];
     let mut from = 0;
     while let Some(at) = haystack[from..].iter().position(|b| *b == first) {

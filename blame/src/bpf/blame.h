@@ -168,6 +168,19 @@ struct proc_cfg {
  * legacy mangling leaves their type arguments out).
  */
 #define PROC_F_TOKIO_BLOCKING 16
+/*
+ * The process's TLS library is read (--tls): a connection that begins with
+ * a TLS handshake is not counted as unread (TLS_UNREAD).
+ */
+#define PROC_F_TLS_READ 32
+/* setsockopt: kernel TLS's level, and its option that takes up reading. */
+#define SOL_TLS 282
+#define TLS_RX 2
+/*
+ * Go's crypto/tls is read: its calls in flight are kept by goroutine
+ * (GO_TLS_CALLS), and a socket call made inside one shows its connection.
+ */
+#define PROC_F_GO_TLS 64
 
 enum {
 	GRPC_ID_NONE = 0,
@@ -516,7 +529,16 @@ enum counter {
 	 * since): their bytes are not looked at.
 	 */
 	TLS_NO_SOCKET = 38,
-	COUNTER_MAX = 39,
+	/*
+	 * Client connections that began with a TLS handshake, in a process
+	 * whose TLS library is not read (no --tls, or a library blame does not
+	 * know): their requests are not seen. Those of them kernel TLS took up
+	 * after the handshake are counted again in TLS_KERNEL, and user space
+	 * takes them off: their plaintext goes through the socket calls.
+	 */
+	TLS_UNREAD = 39,
+	TLS_KERNEL = 40,
+	COUNTER_MAX = 41,
 };
 
 struct runq_hist {

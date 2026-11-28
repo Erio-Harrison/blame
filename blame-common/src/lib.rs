@@ -173,6 +173,12 @@ pub const PROC_F_PARK: u8 = 4;
 /// the poll functions cannot be told apart by name (the legacy mangling
 /// leaves their type arguments out).
 pub const PROC_F_TOKIO_BLOCKING: u8 = 16;
+/// The process's TLS library is read (`--tls`): a connection that begins
+/// with a TLS handshake is not counted as unread ([`Counter::TlsUnread`]).
+pub const PROC_F_TLS_READ: u8 = 32;
+/// Go's `crypto/tls` is read: its calls in flight are kept by goroutine, and
+/// a socket call made inside one shows its connection.
+pub const PROC_F_GO_TLS: u8 = 64;
 
 /// [`RequestEvent::parked`], by index: why the request's goroutine or task
 /// was on no thread. The last two are tokio's: woken by another task, and
@@ -554,10 +560,18 @@ pub enum Counter {
     /// up before the probes were there, and no socket call has shown it
     /// since): their bytes are not looked at.
     TlsNoSocket = 38,
+    /// Client connections that began with a TLS handshake, in a process
+    /// whose TLS library is not read (no `--tls`, or a library blame does not
+    /// know): their requests are not seen. Those kernel TLS took up after
+    /// the handshake ([`Counter::TlsKernel`]) are taken off when read.
+    TlsUnread = 39,
+    /// Client connections that began with a TLS handshake and that kernel TLS
+    /// then took up: their plaintext goes through the socket calls.
+    TlsKernel = 40,
 }
 
 /// Number of slots in the counter array.
-pub const COUNTER_MAX: u32 = 39;
+pub const COUNTER_MAX: u32 = 41;
 
 impl Counter {
     pub const ALL: [Self; COUNTER_MAX as usize] = [
@@ -600,6 +614,8 @@ impl Counter {
         Self::H2ProcessUnread,
         Self::TlsFollowed,
         Self::TlsNoSocket,
+        Self::TlsUnread,
+        Self::TlsKernel,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -643,6 +659,8 @@ impl Counter {
             Self::H2ProcessUnread => "h2_process_unread",
             Self::TlsFollowed => "tls_followed",
             Self::TlsNoSocket => "tls_no_socket",
+            Self::TlsUnread => "tls_unread",
+            Self::TlsKernel => "tls_kernel",
         }
     }
 
@@ -665,6 +683,7 @@ impl Counter {
             | Self::SpawnFollowed
             | Self::OmpTeamIdleCpuNs
             | Self::TlsFollowed
+            | Self::TlsKernel
             | Self::HelperLateNs => false,
             Self::RingbufFull
             | Self::FilenameTruncated
@@ -689,7 +708,8 @@ impl Counter {
             | Self::ReqStreamInsertFailed
             | Self::GrpcHandoffUnmatched
             | Self::H2ProcessUnread
-            | Self::TlsNoSocket => true,
+            | Self::TlsNoSocket
+            | Self::TlsUnread => true,
         }
     }
 }

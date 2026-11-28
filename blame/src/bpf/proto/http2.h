@@ -84,11 +84,18 @@ struct h2_dir {
 /* One call's worth of parsing; lives in a per-CPU scratch slot. */
 struct h2_run {
 	struct h2_dir h;
-	/* The call's data: `iov` 0 means one buffer, already in seg_base/seg_len. */
+	/*
+	 * The call's data: `iov` 0 means buffers given here, the first already
+	 * in seg_base/seg_len, the others in sb/sl up to nseg (a TLS library's
+	 * plaintext in pieces: tls/rustls.h); a base of 0 is bytes not seen.
+	 */
 	u64 iov;
 	u64 iovcnt;
 	u64 seg_base;
 	u64 seg_len;
+	u64 sb[HTTP_SEGS];
+	u64 sl[HTTP_SEGS];
+	u32 nseg;
 	u64 so;
 	/* Bytes of the call not passed yet. */
 	u64 left;
@@ -257,9 +264,22 @@ static long h2_step(u32 i, void *ctx)
 	if (x->so >= x->seg_len) {
 		struct iovec v;
 
+		/* The next buffer given, if there is one to read. */
+		if (!x->iov) {
+			u32 i = x->si;
+
+			v.iov_base = 0;
+			v.iov_len = 0;
+			if (i < x->nseg && i < HTTP_SEGS) {
+				v.iov_base = (void *)x->sb[i & (HTTP_SEGS - 1)];
+				v.iov_len = x->sl[i & (HTTP_SEGS - 1)];
+			}
+		}
 		/* The next segment of a vectored call. */
-		if (!x->iov || x->si >= x->iovcnt ||
-		    bpf_probe_read_user(&v, sizeof(v), (void *)(x->iov + x->si * sizeof(v)))) {
+		if (!x->iov ? !v.iov_base :
+			      x->si >= x->iovcnt ||
+				      bpf_probe_read_user(&v, sizeof(v),
+							  (void *)(x->iov + x->si * sizeof(v)))) {
 			/* Bytes that cannot be seen: fine inside a payload. */
 			if (h->skip >= x->left && !h->hlen) {
 				/* A header block that cannot be seen is a part lost. */

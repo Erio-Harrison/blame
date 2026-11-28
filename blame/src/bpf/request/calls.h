@@ -8,6 +8,35 @@
  * speaks. `tls`: the plaintext of a TLS library's call (tls/tls.h); on a
  * TLS connection the socket calls' own bytes are ciphertext and are passed over.
  */
+/*
+ * The first bytes a client connection followed from its start sends, read
+ * as a TLS handshake record (0x16, version 3.x) or not. Such a connection
+ * is left to the TLS library's probes (conn.tls 2: its socket calls carry
+ * ciphertext, not looked at), and counted as unread (tls_hello 2) where the
+ * process's library is not read. One that kernel TLS takes up later is
+ * given back to the socket calls then (req_enter_setsockopt), and counted
+ * again (TLS_KERNEL), which user space takes off. True: not to be parsed.
+ */
+static __noinline bool tls_hello(struct sock *sk, struct conn *c, struct carrier *cr,
+				      struct call_data *d)
+{
+	u8 head[3] = {};
+
+	if (c->tls || c->tls_hello || c->cls != CONN_CLIENT || !c->fresh || c->proto != PROTO_UNKNOWN ||
+	    !d->nseg || d->len[0] < 3 || !d->base[0])
+		return false;
+	c->tls_hello = 1;
+	if (bpf_probe_read_user(head, sizeof(head), (void *)d->base[0]) || head[0] != 0x16 ||
+	    head[1] != 3 || head[2] > 4)
+		return false;
+	c->tls = 2;
+	if (cr->rt.runtime != RT_UNKNOWN && !(cr->rt.flags & PROC_F_TLS_READ)) {
+		bump(TLS_UNREAD);
+		c->tls_hello = 2;
+	}
+	return true;
+}
+
 static __always_inline void on_data(struct sock *sk, struct carrier *cr, bool rx,
 				    struct call_data *d, bool tls)
 {
@@ -20,6 +49,8 @@ static __always_inline void on_data(struct sock *sk, struct carrier *cr, bool rx
 		if (!c)
 			return;
 	}
+	if (!tls && rx && tls_hello(sk, c, cr, d))
+		return;
 	if (c->tls != tls)
 		return;
 	settle_cpu(cr, now);
@@ -132,10 +163,58 @@ static __always_inline void call_iovecs(struct call_data *d, u64 iov, u64 count,
 	}
 }
 
+/* What the socket calls tell the probes of TLS libraries (tls/). */
+static __always_inline void go_tls_saw_socket(u64 sk);
+static __always_inline void tls_mark(struct sock *sk);
+
+static __always_inline bool nr_is_write(u8 nr)
+{
+	return nr >= NR_WRITE && nr <= NR_SENDMSG;
+}
+
+static __always_inline bool unit_eq(const struct unit_key *a, const struct unit_key *b)
+{
+	return a->tgid == b->tgid && a->kind == b->kind && a->id == b->id;
+}
+
+/*
+ * The socket call after rustls was handed plaintext to send (tls/rustls.h):
+ * a write of `sk` that went out (0: anything else). The plaintext went out
+ * in it if it is the same unit's: true, with the plaintext in `d`, to be
+ * taken instead of the call's ciphertext, if `sk` is a client connection
+ * (one the program is a client on is timed from its socket calls).
+ */
+static __always_inline bool rs_tx_take(struct carrier *cr, u64 sk, struct call_data *d)
+{
+	u64 key = sk;
+	u8 n = cr->rs_tx;
+	struct conn *c;
+
+	cr->rs_tx = 0;
+	if (!sk || !unit_eq(&cr->rs_tx_unit, &cr->unit)) {
+		bump(TLS_NO_SOCKET);
+		return false;
+	}
+	tls_mark((struct sock *)sk);
+	c = bpf_map_lookup_elem(&REQ_CONNS, &key);
+	if (!c || c->tls != 1)
+		return false;
+#pragma unroll
+	for (int i = 0; i < HTTP_SEGS; i++) {
+		d->base[i] = cr->rs_tx_base[i];
+		d->len[i] = cr->rs_tx_len[i];
+	}
+	d->nseg = n > HTTP_SEGS ? HTTP_SEGS : n;
+	d->truncated = n && !d->base[(d->nseg - 1) & (HTTP_SEGS - 1)];
+	d->total = cr->rs_tx_total;
+	return true;
+}
+
 static __always_inline int call_exit(struct trace_event_raw_sys_exit *ctx, u8 nr)
 {
 	struct carrier *cr = carrier_of_current(false);
 	struct call_data d = {};
+	bool plain = false;
 	struct sock *sk;
 	long ret = ctx->ret;
 
@@ -144,16 +223,31 @@ static __always_inline int call_exit(struct trace_event_raw_sys_exit *ctx, u8 nr
 	cr->sc_nr = 0;
 	if (ret == -EAGAIN)
 		call_would_block(cr);
-	if (ret <= 0)
+	if (ret <= 0) {
+		/* A write the socket did not take: what rustls handed over is not seen. */
+		if (cr->rs_tx && nr_is_write(nr) && fd_to_sk((int)cr->sc_fd)) {
+			cr->rs_tx = 0;
+			bump(TLS_NO_SOCKET);
+		}
 		return 0;
+	}
 	sk = fd_to_sk((int)cr->sc_fd);
 	if (!sk)
 		return 0;
 	/* Inside a TLS library's call: the socket its session is on (tls/tls.h). */
 	if (cr->tls_fn)
 		cr->tls_sk = (u64)sk;
-
-	switch (nr) {
+	else if (cr->rt.flags & PROC_F_GO_TLS)
+		go_tls_saw_socket((u64)sk);
+	if (nr <= NR_RECVMSG) {
+		cr->rs_rd_sk = (u64)sk;
+		cr->rs_rd_unit = cr->unit;
+	}
+	/* rustls: the plaintext it was handed goes out in this write, or is not seen. */
+	if (cr->rs_tx && rs_tx_take(cr, nr_is_write(nr) ? (u64)sk : 0, &d))
+		plain = true;
+	else
+		switch (nr) {
 	case NR_RECVFROM:
 		/* A peek leaves the bytes to be read again. */
 		if (cr->sc_a3 & MSG_PEEK)
@@ -188,8 +282,39 @@ static __always_inline int call_exit(struct trace_event_raw_sys_exit *ctx, u8 nr
 		d.len[0] = ret;
 		break;
 	}
-	d.total = ret;
-	on_data(sk, cr, nr <= NR_RECVMSG, &d, false);
+	if (!plain)
+		d.total = ret;
+	on_data(sk, cr, nr <= NR_RECVMSG, &d, plain);
+	return 0;
+}
+
+/*
+ * Kernel TLS taking up a client connection's reading (setsockopt(SOL_TLS,
+ * TLS_RX), once the handshake is done): from here its socket calls carry
+ * plaintext. One left to a TLS library at its handshake (conn.tls 2) is
+ * given back to them, and is not unread after all (TLS_KERNEL).
+ */
+SEC("tracepoint/syscalls/sys_enter_setsockopt")
+int req_enter_setsockopt(struct trace_event_raw_sys_enter *ctx)
+{
+	struct conn *c;
+	struct sock *sk;
+	u64 key;
+
+	if (ctx->args[1] != SOL_TLS || ctx->args[2] != TLS_RX || !traced(cur_pid_tgid() >> 32))
+		return 0;
+	sk = fd_to_sk((int)ctx->args[0]);
+	if (!sk)
+		return 0;
+	key = (u64)sk;
+	c = bpf_map_lookup_elem(&REQ_CONNS, &key);
+	if (!c || c->tls != 2)
+		return 0;
+	c->tls = 0;
+	if (c->tls_hello == 2) {
+		c->tls_hello = 1;
+		bump(TLS_KERNEL);
+	}
 	return 0;
 }
 

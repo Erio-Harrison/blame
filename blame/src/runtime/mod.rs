@@ -12,7 +12,7 @@
 //! in `tokio.rs` and `tasks.rs`), as `bpf/runtime/` does on the kernel side.
 
 pub(crate) mod elf;
-mod go;
+pub(crate) mod go;
 pub mod omp;
 pub mod tasks;
 mod tokio;
