@@ -13,7 +13,10 @@ use blame_common::{
     RT_GO,
 };
 
-use super::{Inspected, Probe, ProbeAt, elf::Elf};
+use super::{
+    Inspected, Probe, ProbeAt,
+    elf::{EM_AARCH64, Elf},
+};
 
 const GRPC_MODULE: &str = "google.golang.org/grpc";
 const FN_EXECUTE: &str = "runtime.execute";
@@ -184,6 +187,63 @@ fn go_functions<const N: usize>(elf: &Elf, names: [&str; N]) -> [Option<u64>; N]
     found
 }
 
+/// Where to probe the entry of the Go function at `addr`: the file offset of
+/// the branch that ends its stack check, or of its first instruction if it
+/// does not start with one this knows.
+///
+/// A uprobe makes the kernel run the instruction it replaces: a branch it
+/// runs itself (~135 ns a hit, measured on arm64, kernel 6.8), any other
+/// one is copied out and single-stepped (~700 ns). Nearly every Go function
+/// starts with a load and a compare, then `b.ls` to grow the stack, and
+/// none of those change what a probe reads: they write only R16, R17 and
+/// the flags, while the arguments (R0..R15), g (R28), SP and LR are as at
+/// the entry. A stack that is grown starts the function again, so the
+/// branch is passed again, as the entry is. Two forms are taken, 99.7% of
+/// the functions with a check in a Go 1.27 binary; the one of big frames
+/// writes R27 as well and is left at the entry. arm64 only.
+pub(crate) fn go_probe_offset(elf: &Elf, addr: u64) -> Option<u64> {
+    elf.file_offset(addr + past_stack_check(elf, addr))
+}
+
+/// How far past `addr` the stack check's `b.ls` is, or 0.
+fn past_stack_check(elf: &Elf, addr: u64) -> u64 {
+    /// `ldr x16, [x28, #16]`: the stack guard of g.
+    const LOAD_GUARD: u32 = 0xf940_0b90;
+    /// `cmp sp, x16`.
+    const CMP_SP: u32 = 0xeb30_63ff;
+    /// `cmp x17, x16`.
+    const CMP_X17: u32 = 0xeb10_023f;
+    /// `sub x17, sp, #imm` (either shift), under its mask.
+    const SUB_X17_SP: (u32, u32) = (0xff80_03ff, 0xd100_03f1);
+    /// `b.ls`, under its mask.
+    const B_LS: (u32, u32) = (0xff00_001f, 0x5400_0009);
+    if elf.machine != EM_AARCH64 {
+        return 0;
+    }
+    let Some(code) = elf.bytes_at(addr, 16) else {
+        return 0;
+    };
+    let word = |i: usize| {
+        u32::from_le_bytes([
+            code[4 * i],
+            code[4 * i + 1],
+            code[4 * i + 2],
+            code[4 * i + 3],
+        ])
+    };
+    let b_ls = |w: u32| w & B_LS.0 == B_LS.1;
+    if word(0) != LOAD_GUARD {
+        return 0;
+    }
+    if word(1) == CMP_SP && b_ls(word(2)) {
+        return 8;
+    }
+    if word(1) & SUB_X17_SP.0 == SUB_X17_SP.1 && word(2) == CMP_X17 && b_ls(word(3)) {
+        return 12;
+    }
+    0
+}
+
 /// Where the functions `names` start and end (the next function's start),
 /// from the Go function table, which stripping leaves in place. `None` for
 /// one that is not there, or all of them if the table is not understood.
@@ -284,7 +344,7 @@ fn grpc(elf: &Elf, buildinfo: &[u8], cfg: ProcCfg) -> Option<(ProcCfg, Vec<Probe
             FN_OPERATE_HEADERS,
         ],
     );
-    let offsets = addrs.map(|addr| addr.and_then(|addr| elf.file_offset(addr)));
+    let offsets = addrs.map(|addr| addr.and_then(|addr| go_probe_offset(elf, addr)));
     let [
         Some(execute),
         Some(conn),
@@ -388,7 +448,7 @@ fn follow_spawned(elf: &Elf, minor: u32, found: &mut Inspected, plain_cfg: ProcC
             runtime_starts.push(addr);
         }
     });
-    let Some(offset) = newproc.and_then(|addr| elf.file_offset(addr)) else {
+    let Some(offset) = newproc.and_then(|addr| go_probe_offset(elf, addr)) else {
         note.push_str("; spawned goroutines not followed: runtime.newproc1 not found");
         return;
     };
@@ -397,7 +457,7 @@ fn follow_spawned(elf: &Elf, minor: u32, found: &mut Inspected, plain_cfg: ProcC
     // with no kernel event in between would otherwise get their CPU.
     let [execute] = go_functions(elf, [FN_EXECUTE]);
     let has_execute = found.probes.iter().any(|p| p.at == ProbeAt::GoExecute);
-    let execute = match execute.and_then(|addr| elf.file_offset(addr)) {
+    let execute = match execute.and_then(|addr| go_probe_offset(elf, addr)) {
         Some(offset) => offset,
         None if has_execute => 0,
         None => {
@@ -421,7 +481,7 @@ fn follow_spawned(elf: &Elf, minor: u32, found: &mut Inspected, plain_cfg: ProcC
     // Why goroutines park: the reasons of this version must be known.
     let [gopark] = go_functions(elf, [FN_GOPARK]);
     match (
-        gopark.and_then(|addr| elf.file_offset(addr)),
+        gopark.and_then(|addr| go_probe_offset(elf, addr)),
         go_wait_kinds(minor),
     ) {
         (Some(offset), Some(kinds)) => {
@@ -448,7 +508,7 @@ fn follow_spawned(elf: &Elf, minor: u32, found: &mut Inspected, plain_cfg: ProcC
     // When a goroutine that has returned leaves its thread: exact with the probe,
     // known at the thread's next goroutine or sleep without it.
     let [goexit] = go_functions(elf, [FN_GOEXIT0]);
-    if let Some(offset) = goexit.and_then(|addr| elf.file_offset(addr)) {
+    if let Some(offset) = goexit.and_then(|addr| go_probe_offset(elf, addr)) {
         found.probes.push(Probe {
             at: ProbeAt::GoExit,
             offset,
@@ -544,7 +604,7 @@ pub(super) fn inspect(elf: &Elf, spawned: bool) -> Option<Inspected> {
     // handler's CPU, measured, when it waits for goroutines it spawned).
     let [execute] = go_functions(elf, [FN_EXECUTE]);
     if !found.probes.iter().any(|p| p.at == ProbeAt::GoExecute)
-        && let Some(offset) = execute.and_then(|addr| elf.file_offset(addr))
+        && let Some(offset) = execute.and_then(|addr| go_probe_offset(elf, addr))
     {
         found.probes.push(Probe {
             at: ProbeAt::GoExecute,
@@ -674,5 +734,50 @@ mod tests {
         assert_eq!(offsets(27), Some((152, 184)));
         assert_eq!(go_offsets(17), None);
         assert_eq!(go_offsets(28), None);
+    }
+
+    /// The go command of this machine's toolchain, if there is one: the
+    /// runtime functions probed are probed at their stack check's b.ls, and
+    /// a function without the check (assembly, no frame) at its entry.
+    #[test]
+    fn go_entries_are_probed_past_the_stack_check() {
+        let Ok(go) = std::process::Command::new("go")
+            .args(["env", "GOROOT"])
+            .output()
+        else {
+            return;
+        };
+        let root = String::from_utf8_lossy(&go.stdout).trim().to_owned();
+        let image = std::fs::read(std::path::Path::new(&root).join("bin/go")).expect("read");
+        let elf = Elf::parse(&image).expect("ELF");
+        let found = go_functions(
+            &elf,
+            [
+                FN_EXECUTE,
+                FN_NEWPROC1,
+                FN_GOPARK,
+                FN_GOEXIT0,
+                "runtime.gogo.abi0",
+            ],
+        );
+        let word = |addr: u64| {
+            let at = elf.file_offset(addr).expect("in the file") as usize;
+            u32::from_le_bytes(image[at..at + 4].try_into().unwrap())
+        };
+        for addr in &found[..4] {
+            let addr = addr.expect("runtime function");
+            let at = go_probe_offset(&elf, addr).expect("offset");
+            if elf.machine != EM_AARCH64 {
+                assert_eq!(Some(at), elf.file_offset(addr));
+                continue;
+            }
+            assert!(at > elf.file_offset(addr).unwrap());
+            let at = at as usize;
+            let w = u32::from_le_bytes(image[at..at + 4].try_into().unwrap());
+            assert_eq!(w & 0xff00_001f, 0x5400_0009, "{addr:#x}");
+        }
+        let gogo = found[4].expect("runtime.gogo");
+        assert_ne!(word(gogo), 0xf940_0b90);
+        assert_eq!(go_probe_offset(&elf, gogo), elf.file_offset(gogo));
     }
 }

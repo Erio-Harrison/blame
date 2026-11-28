@@ -14,7 +14,9 @@
  *   thread: the g, not the thread, is what ties the two.
  * - The entry can run twice for one call: when the goroutine's stack is too
  *   small the prologue grows it and starts the function again. The later
- *   entry stands (the buffer may have moved with the stack).
+ *   entry stands (the buffer may have moved with the stack). The entry probe
+ *   is at the prologue's b.ls, where nothing it reads has changed yet
+ *   (go_probe_offset in src/runtime/go.rs).
  * - Which socket a connection is on is shown by a socket call the
  *   goroutine makes inside the call (call_exit -> go_tls_saw_socket): every
  *   Write makes one, and most Reads, and the handshake (probed as well for
@@ -28,10 +30,11 @@ enum {
 	GO_TLS_READ = 1,
 	GO_TLS_WRITE,
 	/*
-	 * (*Conn).handshakeContext: no plaintext, but socket calls inside it
-	 * place the session. net/http shakes hands before its first Read, and
-	 * what the client sent right after may be read from what the handshake
-	 * took in, with no socket call in that Read.
+	 * (*Conn).serverHandshake or clientHandshake: no plaintext, but socket
+	 * calls inside it place the session. net/http shakes hands before its
+	 * first Read, and what the client sent right after may be read from
+	 * what the handshake took in, with no socket call in that Read. Not
+	 * handshakeContext, which every Read and Write calls.
 	 */
 	GO_TLS_HANDSHAKE,
 };

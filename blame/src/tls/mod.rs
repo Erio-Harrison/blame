@@ -140,6 +140,13 @@ pub fn attach(skel: &Skel, pid: u32, found: &Found) -> Result<Option<(String, Ve
     }
     let exe = Path::new("/proc").join(pid.to_string()).join("exe");
     if let Some(go) = &found.go {
+        let handshakes = go.handshakes.iter().map(|f| {
+            (
+                f,
+                &progs.up_go_tls_handshake,
+                &progs.up_go_tls_handshake_ret,
+            )
+        });
         for (fn_, entry, ret) in [
             (&go.read, &progs.up_go_tls_read, &progs.up_go_tls_read_ret),
             (
@@ -147,12 +154,10 @@ pub fn attach(skel: &Skel, pid: u32, found: &Found) -> Result<Option<(String, Ve
                 &progs.up_go_tls_write,
                 &progs.up_go_tls_write_ret,
             ),
-            (
-                &go.handshake,
-                &progs.up_go_tls_handshake,
-                &progs.up_go_tls_handshake_ret,
-            ),
-        ] {
+        ]
+        .into_iter()
+        .chain(handshakes)
+        {
             // At the return instructions themselves: uprobes, not return probes.
             for offset in &fn_.returns {
                 at(ret, false, &exe, *offset, "a return of crypto/tls")?;

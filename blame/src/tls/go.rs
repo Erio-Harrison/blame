@@ -12,14 +12,24 @@
 
 use crate::runtime::{
     elf::{EM_AARCH64, Elf},
-    go::go_function_ranges,
+    go::{go_function_ranges, go_probe_offset},
 };
 
 const FN_READ: &str = "crypto/tls.(*Conn).Read";
 const FN_WRITE: &str = "crypto/tls.(*Conn).Write";
-/// Where the handshake is made, by Read, Write or Handshake: its socket
-/// calls show which socket a session is on before its first Read.
-const FN_HANDSHAKE: &str = "crypto/tls.(*Conn).handshakeContext";
+/// What Read, Write and Handshake call before the handshake is done; here
+/// only to tell Go 1.17 and later (whose internal ABI the probes read).
+const FN_HANDSHAKE_CONTEXT: &str = "crypto/tls.(*Conn).handshakeContext";
+/// Where the handshake is made (`handshakeFn`), by the server or the client
+/// side: its socket calls show which socket a session is on before its
+/// first Read. `handshakeContext` would be too, but it is called by every
+/// Read and Write, returning at once after the handshake: probed, it cost
+/// ~1.1 µs each time. A binary that is only a client (or only a server)
+/// has only one of them.
+const FN_HANDSHAKES: [&str; 2] = [
+    "crypto/tls.(*Conn).serverHandshake",
+    "crypto/tls.(*Conn).clientHandshake",
+];
 /// `ret` on arm64.
 const ARM64_RET: u32 = 0xd65f_03c0;
 
@@ -35,7 +45,8 @@ pub struct EntryAndReturns {
 pub struct GoTls {
     pub read: EntryAndReturns,
     pub write: EntryAndReturns,
-    pub handshake: EntryAndReturns,
+    /// The server's and the client's handshake, those in the binary.
+    pub handshakes: Vec<EntryAndReturns>,
 }
 
 /// `Ok(None)`: not a Go binary, or one without crypto/tls. `Err`: one whose
@@ -44,14 +55,24 @@ pub fn find(elf: &Elf) -> Result<Option<GoTls>, String> {
     if elf.section(".gopclntab").is_none() {
         return Ok(None);
     }
-    let [Some(read), Some(write), handshake] =
-        go_function_ranges(elf, [FN_READ, FN_WRITE, FN_HANDSHAKE])
-    else {
+    let [Some(read), Some(write), context, server, client] = go_function_ranges(
+        elf,
+        [
+            FN_READ,
+            FN_WRITE,
+            FN_HANDSHAKE_CONTEXT,
+            FN_HANDSHAKES[0],
+            FN_HANDSHAKES[1],
+        ],
+    ) else {
         return Ok(None);
     };
-    let Some(handshake) = handshake else {
+    if context.is_none() {
         return Err("crypto/tls without (*Conn).handshakeContext (Go older than 1.17)".into());
-    };
+    }
+    if server.is_none() && client.is_none() {
+        return Err("crypto/tls without a handshake function".into());
+    }
     if elf.machine != EM_AARCH64 {
         return Err(
             "Go's crypto/tls is read on arm64 only (where its functions return is not found \
@@ -78,14 +99,18 @@ pub fn find(elf: &Elf) -> Result<Option<GoTls>, String> {
             ));
         }
         Ok(EntryAndReturns {
-            entry: elf.file_offset(start).ok_or_else(not_read)?,
+            entry: go_probe_offset(elf, start).ok_or_else(not_read)?,
             returns,
         })
     };
     Ok(Some(GoTls {
         read: probe(read)?,
         write: probe(write)?,
-        handshake: probe(handshake)?,
+        handshakes: [server, client]
+            .into_iter()
+            .flatten()
+            .map(probe)
+            .collect::<Result<_, _>>()?,
     }))
 }
 
@@ -116,7 +141,15 @@ mod tests {
             found.read.returns.len() >= 2 && found.write.returns.len() >= 2,
             "{found:?}"
         );
-        assert!(!found.handshake.returns.is_empty(), "{found:?}");
+        // The go command is a client only: the server's handshake is not linked in.
+        assert_eq!(found.handshakes.len(), 1, "{found:?}");
+        assert!(!found.handshakes[0].returns.is_empty(), "{found:?}");
+        // Probed past the stack check, at its b.ls.
+        for f in [&found.read, &found.write, &found.handshakes[0]] {
+            let at = f.entry as usize;
+            let word = u32::from_le_bytes(image[at..at + 4].try_into().unwrap());
+            assert_eq!(word & 0xff00_001f, 0x5400_0009, "{found:?}");
+        }
         for at in found.read.returns.iter().chain(&found.write.returns) {
             let at = *at as usize;
             assert_eq!(&image[at..at + 4], &ARM64_RET.to_le_bytes());
